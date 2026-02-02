@@ -2,3 +2,4 @@
 .verbatim
 .env
 .venv-wsl
+.venv
