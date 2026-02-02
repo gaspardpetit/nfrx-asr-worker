@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypedDict
 
@@ -38,6 +39,10 @@ from pyannote.audio import Pipeline
 import torchaudio
 
 
+class JobCanceled(Exception):
+    pass
+
+
 @dataclass
 class AuthConfig:
     client_key: Optional[str] = None
@@ -51,6 +56,7 @@ class JobClaim(TypedDict):
 
 ProcessHandler = Callable[[JobClaim, bytes], Awaitable[Tuple[bytes, Optional[str]]]]
 StatusHandler = Callable[[str, Optional[Dict[str, Any]]], Awaitable[None]]
+StatusPayload = Dict[str, Any]
 
 DEFAULT_BASE_URL = "https://nfrx.l3ia.ca/"
 
@@ -83,6 +89,135 @@ class WorkerConfig:
     once: bool = False
     log_level: str = "INFO"
     strategy: str = "verbatim"  # verbatim|fast
+    status_progress: bool = True
+    status_interval_seconds: float = 2.0
+    status_min_progress_seconds: float = 1.0
+    status_include_utterance: bool = False
+    status_watchdog_seconds: float = 20.0
+
+
+class NfrxStatusPoster:
+    def __init__(
+        self,
+        worker: "NfrxJobsWorker",
+        min_interval_seconds: float,
+        min_progress_seconds: float,
+    ) -> None:
+        self._worker = worker
+        self._min_interval_seconds = min_interval_seconds
+        self._min_progress_seconds = min_progress_seconds
+        self._queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+        self._task: Optional[asyncio.Task[None]] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._closed = False
+        self._completed_jobs: set[str] = set()
+        self._last_progress: dict[str, float] = {}
+        self._last_progress_time: dict[str, float] = {}
+        self._watchdogs: dict[str, asyncio.Task[None]] = {}
+
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        if self._task is None:
+            self._loop = loop
+            self._task = loop.create_task(self._run())
+
+    async def stop(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self._queue.put(None)
+        for task in self._watchdogs.values():
+            task.cancel()
+        if self._watchdogs:
+            await asyncio.gather(*self._watchdogs.values(), return_exceptions=True)
+        self._watchdogs.clear()
+        if self._task is not None:
+            await self._task
+
+    def mark_done(self, job_id: str) -> None:
+        self._completed_jobs.add(job_id)
+        self._last_progress.pop(job_id, None)
+        self._last_progress_time.pop(job_id, None)
+        watchdog = self._watchdogs.pop(job_id, None)
+        if watchdog is not None:
+            watchdog.cancel()
+
+    def enqueue(self, job_id: str, payload: StatusPayload) -> None:
+        if self._closed or job_id in self._completed_jobs:
+            return
+        self._queue.put_nowait({"job_id": job_id, "payload": payload})
+
+    def start_watchdog(self, job_id: str, interval_seconds: float, payload: StatusPayload) -> None:
+        if interval_seconds <= 0 or self._closed or job_id in self._completed_jobs:
+            return
+        if job_id in self._watchdogs:
+            return
+        loop = self._loop
+        if loop is None:
+            raise RuntimeError("Status poster not started")
+
+        async def _watchdog() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(interval_seconds)
+                    if self._closed or job_id in self._completed_jobs:
+                        return
+                    self.enqueue(job_id, payload)
+            except asyncio.CancelledError:
+                return
+
+        self._watchdogs[job_id] = loop.create_task(_watchdog())
+
+    def build_hook(
+        self,
+        job_id: str,
+        include_utterance: bool,
+    ) -> Callable[[Any], None]:
+        loop = self._loop
+        if loop is None:
+            raise RuntimeError("Status poster not started")
+
+        def hook(update: Any) -> None:
+            payload = _status_update_to_payload(update, include_utterance)
+            if payload is None:
+                return
+            loop.call_soon_threadsafe(self.enqueue, job_id, payload)
+
+        return hook
+
+    async def _run(self) -> None:
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                return
+            job_id = item.get("job_id")
+            payload = item.get("payload") or {}
+            if not job_id or job_id in self._completed_jobs:
+                continue
+            progress = payload.get("progress")
+            if isinstance(progress, dict) and "current" in progress:
+                try:
+                    current = float(progress["current"])
+                except (TypeError, ValueError):
+                    current = None
+                if current is not None:
+                    now = time.monotonic()
+                    last_current = self._last_progress.get(job_id)
+                    last_time = self._last_progress_time.get(job_id, 0.0)
+                    if (
+                        last_current is not None
+                        and (current - last_current) < self._min_progress_seconds
+                        and (now - last_time) < self._min_interval_seconds
+                    ):
+                        continue
+                    self._last_progress[job_id] = current
+                    self._last_progress_time[job_id] = now
+            try:
+                await self._worker.update_status(job_id, "running", payload=payload)
+            except JobCanceled:
+                logging.info("job canceled while posting status: %s", job_id)
+                self.mark_done(job_id)
+            except httpx.HTTPError:
+                logging.exception("status update failed for job %s", job_id)
 
 
 class NfrxJobsWorker:
@@ -100,6 +235,10 @@ class NfrxJobsWorker:
             headers["Authorization"] = f"Bearer {self._auth.client_key}"
         return headers
 
+    def _raise_if_canceled(self, resp: httpx.Response, job_id: Optional[str]) -> None:
+        if resp.status_code == 409:
+            raise JobCanceled(job_id or "unknown")
+
     async def claim_job(
         self, types: Optional[list[str]] = None, max_wait_seconds: Optional[int] = None
     ) -> Optional[JobClaim]:
@@ -116,11 +255,13 @@ class NfrxJobsWorker:
 
     async def request_payload_channel(self, job_id: str) -> Dict[str, Any]:
         resp = await self._client.post(f"/api/jobs/{job_id}/payload", headers=self._headers())
+        self._raise_if_canceled(resp, job_id)
         resp.raise_for_status()
         return resp.json()
 
     async def request_result_channel(self, job_id: str) -> Dict[str, Any]:
         resp = await self._client.post(f"/api/jobs/{job_id}/result", headers=self._headers())
+        self._raise_if_canceled(resp, job_id)
         resp.raise_for_status()
         return resp.json()
 
@@ -131,15 +272,18 @@ class NfrxJobsWorker:
         resp = await self._client.post(
             f"/api/jobs/{job_id}/status", json=body, headers=self._headers()
         )
+        self._raise_if_canceled(resp, job_id)
         resp.raise_for_status()
 
-    async def read_payload(self, url: str) -> bytes:
+    async def read_payload(self, url: str, job_id: Optional[str] = None) -> bytes:
         resp = await self._client.get(url, headers=self._headers())
+        self._raise_if_canceled(resp, job_id)
         resp.raise_for_status()
         return resp.content
 
-    async def write_result(self, url: str, data: bytes) -> None:
+    async def write_result(self, url: str, data: bytes, job_id: Optional[str] = None) -> None:
         resp = await self._client.post(url, content=data, headers=self._headers())
+        self._raise_if_canceled(resp, job_id)
         resp.raise_for_status()
 
     async def run_once(
@@ -173,7 +317,7 @@ class NfrxJobsWorker:
             payload_url = payload_channel.get("reader_url") or payload_channel.get("url")
             if on_status:
                 await on_status("awaiting_payload", payload_channel)
-            payload_bytes = await self.read_payload(payload_url)
+            payload_bytes = await self.read_payload(payload_url, job_id=job_id)
             logging.info("payload received: %s bytes", len(payload_bytes))
 
             await self.update_status(job_id, "running")
@@ -196,20 +340,26 @@ class NfrxJobsWorker:
             result_url = result_channel.get("writer_url") or result_channel.get("url")
             if on_status:
                 await on_status("awaiting_result", result_channel)
-            await self.write_result(result_url, result_bytes)
+            await self.write_result(result_url, result_bytes, job_id=job_id)
             logging.info("result uploaded: %s bytes", len(result_bytes))
 
             await self.update_status(job_id, "completed")
             if on_status:
                 await on_status("completed", None)
             return True
+        except JobCanceled:
+            logging.info("job canceled: %s", job_id)
+            return True
         except httpx.HTTPError as exc:
             logging.exception("http error while handling job %s", job_id)
-            await self.update_status(
-                job_id,
-                "failed",
-                payload={"error": {"code": "http_error", "message": str(exc)}},
-            )
+            try:
+                await self.update_status(
+                    job_id,
+                    "failed",
+                    payload={"error": {"code": "http_error", "message": str(exc)}},
+                )
+            except JobCanceled:
+                logging.info("job canceled while reporting failure: %s", job_id)
             if on_status:
                 await on_status("failed", {"error": {"code": "http_error", "message": str(exc)}})
             return True
@@ -313,6 +463,40 @@ def _output_format_from_formats(output_formats: list[str]) -> str:
     if "docx" in output_formats:
         return "docx"
     return "json"
+
+
+def _status_update_to_payload(update: Any, include_utterance: bool) -> Optional[StatusPayload]:
+    if update is None:
+        return None
+    payload: StatusPayload = {}
+    state = getattr(update, "state", None)
+    if isinstance(state, str) and state.strip():
+        payload["phase"] = state
+    progress = getattr(update, "progress", None)
+    if progress is not None:
+        progress_payload: Dict[str, Any] = {}
+        for key in ("current", "start", "finish", "units"):
+            value = getattr(progress, key, None)
+            if value is None:
+                continue
+            progress_payload[key] = float(value) if isinstance(value, (int, float)) else value
+        if progress_payload:
+            payload["progress"] = progress_payload
+    if include_utterance:
+        utterance = getattr(update, "utterance", None)
+        if utterance is not None:
+            utterance_payload: Dict[str, Any] = {
+                "text": getattr(utterance, "text", None),
+                "speaker": getattr(utterance, "speaker", None),
+            }
+            if hasattr(utterance, "get_start"):
+                utterance_payload["start"] = float(utterance.get_start())
+            if hasattr(utterance, "get_end"):
+                utterance_payload["end"] = float(utterance.get_end())
+            payload["utterance"] = utterance_payload
+    if "progress" not in payload and "utterance" not in payload:
+        return None
+    return payload
 
 
 def _apply_job_config(
@@ -498,7 +682,12 @@ class VerbatimService:
         working_prefix = basename if cfg.working_dir is None else os.path.join(cfg.working_dir, basename)
         return cfg, output_prefix, working_prefix
 
-    def transcribe_file(self, path: str, language: Optional[list[str]]) -> Tuple[str, list[Dict[str, Any]], list[Any]]:
+    def transcribe_file(
+        self,
+        path: str,
+        language: Optional[list[str]],
+        status_hook: Optional[Callable[[Any], None]] = None,
+    ) -> Tuple[str, list[Dict[str, Any]], list[Any]]:
         cfg, output_prefix, working_prefix = self._build_config(language, path)
         try:
             with open(path, "rb") as fh:
@@ -506,7 +695,7 @@ class VerbatimService:
         except OSError as exc:
             raise RuntimeError(f"Failed to read input file '{path}': {exc}") from exc
 
-        transcriber = Verbatim(cfg, models=self._models)
+        transcriber = Verbatim(cfg, models=self._models, status_hook=status_hook)
         utterances: list[Any] = []
         for audio_source in create_audio_sources(
             source_config=self._source_config,
@@ -545,12 +734,13 @@ class VerbatimService:
         input_label: str,
         language: Optional[list[str]],
         source_config: Optional[SourceConfig] = None,
+        status_hook: Optional[Callable[[Any], None]] = None,
     ) -> Tuple[str, list[Dict[str, Any]], list[Any]]:
         cfg, output_prefix, working_prefix = self._build_config(language, input_label)
         cfg.cache.set_bytes(input_label, payload)
         use_source_config = source_config or self._source_config
 
-        transcriber = Verbatim(cfg, models=self._models)
+        transcriber = Verbatim(cfg, models=self._models, status_hook=status_hook)
         utterances: list[Any] = []
         for audio_source in create_audio_sources(
             source_config=use_source_config,
@@ -705,7 +895,15 @@ async def transcribe_handler(
     diarize_enabled: bool,
     base_verbatim_args: argparse.Namespace,
     base_output_formats: list[str],
+    status_poster: Optional[NfrxStatusPoster],
+    status_include_utterance: bool,
+    status_watchdog_seconds: float,
 ) -> Tuple[bytes, Optional[str]]:
+    job_id = job.get("job_id") or job.get("id") or ""
+    status_hook: Optional[Callable[[Any], None]] = None
+    if status_poster and job_id:
+        status_hook = status_poster.build_hook(job_id, status_include_utterance)
+        status_poster.start_watchdog(job_id, status_watchdog_seconds, {"message": "working"})
     try:
         metadata = job.get("metadata") or {}
         filename = metadata.get("filename") or metadata.get("name")
@@ -742,6 +940,7 @@ async def transcribe_handler(
             input_label,
             language,
             source_config,
+            status_hook,
         )
         if output_format == "text":
             if utterances is not None:
@@ -766,6 +965,9 @@ async def transcribe_handler(
     except Exception as exc:
         logging.exception("transcription failure")
         return b"", str(exc)
+    finally:
+        if status_poster and job_id:
+            status_poster.mark_done(job_id)
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -796,6 +998,45 @@ async def run(args: argparse.Namespace) -> int:
         once=_resolve_bool(args.once, _cfg_get(config_data, "worker", "once"), os.environ.get("NFRX_ONCE"), False),
         log_level=_resolve(args.log_level, _cfg_get(config_data, "worker", "log_level"), os.environ.get("LOG_LEVEL"), "INFO"),
         strategy=_resolve(args.strategy, _cfg_get(config_data, "worker", "strategy"), os.environ.get("ASR_STRATEGY"), "verbatim"),
+        status_progress=_resolve_bool(
+            args.status_progress,
+            _cfg_get(config_data, "worker", "status_progress"),
+            os.environ.get("NFRX_STATUS_PROGRESS"),
+            True,
+        ),
+        status_interval_seconds=_resolve_float(
+            _resolve(
+                args.status_interval_seconds,
+                _cfg_get(config_data, "worker", "status_interval_seconds"),
+                os.environ.get("NFRX_STATUS_INTERVAL_SECONDS"),
+                2.0,
+            ),
+            2.0,
+        ),
+        status_min_progress_seconds=_resolve_float(
+            _resolve(
+                args.status_min_progress_seconds,
+                _cfg_get(config_data, "worker", "status_min_progress_seconds"),
+                os.environ.get("NFRX_STATUS_MIN_PROGRESS_SECONDS"),
+                1.0,
+            ),
+            1.0,
+        ),
+        status_include_utterance=_resolve_bool(
+            args.status_include_utterance,
+            _cfg_get(config_data, "worker", "status_include_utterance"),
+            os.environ.get("NFRX_STATUS_INCLUDE_UTTERANCE"),
+            False,
+        ),
+        status_watchdog_seconds=_resolve_float(
+            _resolve(
+                args.status_watchdog_seconds,
+                _cfg_get(config_data, "worker", "status_watchdog_seconds"),
+                os.environ.get("NFRX_STATUS_WATCHDOG_SECONDS"),
+                20.0,
+            ),
+            20.0,
+        ),
     )
 
     logging.getLogger().setLevel(getattr(logging, str(worker_cfg.log_level).upper(), logging.INFO))
@@ -877,6 +1118,14 @@ async def run(args: argparse.Namespace) -> int:
     source_config = verbatim_configure.make_source_config(verbatim_cfg_args, speakers_resolved)
 
     worker = NfrxJobsWorker(worker_cfg.base_url, auth)
+    status_poster: Optional[NfrxStatusPoster] = None
+    if worker_cfg.status_progress:
+        status_poster = NfrxStatusPoster(
+            worker,
+            min_interval_seconds=worker_cfg.status_interval_seconds,
+            min_progress_seconds=worker_cfg.status_min_progress_seconds,
+        )
+        status_poster.start(asyncio.get_running_loop())
     verbatim_service = VerbatimService(transcription_cfg, diarization_cfg, source_config, write_config)
     fast_service = FastWhisperService(transcription_cfg)
     diarization_service = DiarizationService(diarization_cfg, transcription_cfg.device)
@@ -895,6 +1144,9 @@ async def run(args: argparse.Namespace) -> int:
                     diarization_cfg.enabled and diarization_cfg.speakers not in (1, "1"),
                     verbatim_cfg_args,
                     output_formats,
+                    status_poster,
+                    worker_cfg.status_include_utterance,
+                    worker_cfg.status_watchdog_seconds,
                 ),
                 types=types,
                 max_wait_seconds=worker_cfg.max_wait_seconds,
@@ -902,6 +1154,8 @@ async def run(args: argparse.Namespace) -> int:
             if handled and worker_cfg.once:
                 return 0
     finally:
+        if status_poster:
+            await status_poster.stop()
         await worker.close()
 
 
@@ -927,6 +1181,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--diarization-speakers", type=int, default=None)
     parser.add_argument("--huggingface-token", default=None)
     parser.add_argument("--log-level", default=None)
+    parser.add_argument("--status-progress", action="store_true", default=None)
+    parser.add_argument("--no-status-progress", dest="status_progress", action="store_false")
+    parser.add_argument("--status-interval-seconds", type=float, default=None)
+    parser.add_argument("--status-min-progress-seconds", type=float, default=None)
+    parser.add_argument("--status-include-utterance", action="store_true", default=None)
+    parser.add_argument("--status-watchdog-seconds", type=float, default=None)
     return parser
 
 

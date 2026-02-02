@@ -17,6 +17,10 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypedDict
 import httpx
 
 
+class JobCanceled(Exception):
+    pass
+
+
 @dataclass
 class AuthConfig:
     client_key: Optional[str] = None
@@ -47,6 +51,10 @@ class NfrxJobsWorker:
             headers["Authorization"] = f"Bearer {self._auth.client_key}"
         return headers
 
+    def _raise_if_canceled(self, resp: httpx.Response, job_id: Optional[str]) -> None:
+        if resp.status_code == 409:
+            raise JobCanceled(job_id or "unknown")
+
     async def claim_job(
         self, types: Optional[list[str]] = None, max_wait_seconds: Optional[int] = None
     ) -> Optional[JobClaim]:
@@ -63,11 +71,13 @@ class NfrxJobsWorker:
 
     async def request_payload_channel(self, job_id: str) -> Dict[str, Any]:
         resp = await self._client.post(f"/api/jobs/{job_id}/payload", headers=self._headers())
+        self._raise_if_canceled(resp, job_id)
         resp.raise_for_status()
         return resp.json()
 
     async def request_result_channel(self, job_id: str) -> Dict[str, Any]:
         resp = await self._client.post(f"/api/jobs/{job_id}/result", headers=self._headers())
+        self._raise_if_canceled(resp, job_id)
         resp.raise_for_status()
         return resp.json()
 
@@ -78,15 +88,18 @@ class NfrxJobsWorker:
         resp = await self._client.post(
             f"/api/jobs/{job_id}/status", json=body, headers=self._headers()
         )
+        self._raise_if_canceled(resp, job_id)
         resp.raise_for_status()
 
-    async def read_payload(self, url: str) -> bytes:
+    async def read_payload(self, url: str, job_id: Optional[str] = None) -> bytes:
         resp = await self._client.get(url, headers=self._headers())
+        self._raise_if_canceled(resp, job_id)
         resp.raise_for_status()
         return resp.content
 
-    async def write_result(self, url: str, data: bytes) -> None:
+    async def write_result(self, url: str, data: bytes, job_id: Optional[str] = None) -> None:
         resp = await self._client.post(url, content=data, headers=self._headers())
+        self._raise_if_canceled(resp, job_id)
         resp.raise_for_status()
 
     async def run_once(
@@ -111,7 +124,7 @@ class NfrxJobsWorker:
             payload_url = payload_channel.get("reader_url") or payload_channel.get("url")
             if on_status:
                 await on_status("awaiting_payload", payload_channel)
-            payload_bytes = await self.read_payload(payload_url)
+            payload_bytes = await self.read_payload(payload_url, job_id=job_id)
 
             await self.update_status(job_id, "running")
             if on_status:
@@ -132,18 +145,24 @@ class NfrxJobsWorker:
             result_url = result_channel.get("writer_url") or result_channel.get("url")
             if on_status:
                 await on_status("awaiting_result", result_channel)
-            await self.write_result(result_url, result_bytes)
+            await self.write_result(result_url, result_bytes, job_id=job_id)
 
             await self.update_status(job_id, "completed")
             if on_status:
                 await on_status("completed", None)
             return True
+        except JobCanceled:
+            print(f"job canceled: {job_id}")
+            return True
         except httpx.HTTPError as exc:
-            await self.update_status(
-                job_id,
-                "failed",
-                payload={"error": {"code": "http_error", "message": str(exc)}},
-            )
+            try:
+                await self.update_status(
+                    job_id,
+                    "failed",
+                    payload={"error": {"code": "http_error", "message": str(exc)}},
+                )
+            except JobCanceled:
+                print(f"job canceled while reporting failure: {job_id}")
             if on_status:
                 await on_status("failed", {"error": {"code": "http_error", "message": str(exc)}})
             return True
