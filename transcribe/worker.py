@@ -89,6 +89,7 @@ class WorkerConfig:
     base_url: str = DEFAULT_BASE_URL
     types: Optional[str] = "asr.transcribe"
     max_wait_seconds: int = 30
+    concurrency: int = 4
     once: bool = False
     log_level: str = "INFO"
     backend: str = "auto"  # auto|verbatim|mlx-vibevoice
@@ -466,6 +467,8 @@ def _output_format_from_formats(output_formats: list[str]) -> str:
         return "text"
     if "docx" in output_formats:
         return "docx"
+    if "jsonl" in output_formats:
+        return "jsonl"
     return "json"
 
 
@@ -677,6 +680,22 @@ def _format_text_from_segments(segments: list[Dict[str, Any]]) -> str:
         if text:
             lines.append(f"[{speaker}] {text}")
     return "\n".join(lines).strip()
+
+
+def _format_jsonl_output(segments: list[Dict[str, Any]]) -> bytes:
+    lines: list[str] = []
+    for seg in segments:
+        payload = {
+            "speaker": seg.get("speaker"),
+            "start": float(seg.get("start", 0.0)),
+            "end": float(seg.get("end", seg.get("start", 0.0))),
+            "text": (seg.get("text") or "").strip(),
+        }
+        lines.append(json.dumps(payload, ensure_ascii=False))
+    text = "\n".join(lines)
+    if text:
+        text += "\n"
+    return text.encode("utf-8")
 
 
 class VerbatimService:
@@ -1084,6 +1103,11 @@ async def transcribe_handler(
             logging.info("transcription produced %s bytes (docx output)", len(formatted_docx))
             logging.info("returning docx payload (%s bytes)", len(formatted_docx))
             return formatted_docx, None
+        if output_format == "jsonl":
+            formatted_jsonl = _format_jsonl_output(segments)
+            logging.info("transcription produced %s lines (jsonl output)", len(segments))
+            logging.info("returning jsonl payload (%s bytes)", len(formatted_jsonl))
+            return formatted_jsonl, None
 
         result = {"text": text, "segments": segments}
         logging.info("transcription produced %s chars, %s segments (json output)", len(text), len(segments))
@@ -1121,6 +1145,14 @@ async def run(args: argparse.Namespace) -> int:
         max_wait_seconds=_resolve_int(
             _resolve(args.max_wait_seconds, _cfg_get(config_data, "worker", "max_wait_seconds"), os.environ.get("NFRX_MAX_WAIT_SECONDS"), 30),
             30,
+        ),
+        concurrency=max(
+            1,
+            _resolve_int(
+                _resolve(args.concurrency, _cfg_get(config_data, "worker", "concurrency"), os.environ.get("NFRX_CONCURRENCY"), 4),
+                4,
+            )
+            or 4,
         ),
         once=_resolve_bool(args.once, _cfg_get(config_data, "worker", "once"), os.environ.get("NFRX_ONCE"), False),
         log_level=_resolve(args.log_level, _cfg_get(config_data, "worker", "log_level"), os.environ.get("LOG_LEVEL"), "INFO"),
@@ -1270,31 +1302,47 @@ async def run(args: argparse.Namespace) -> int:
     diarization_service = DiarizationService(diarization_cfg, transcription_cfg.device)
     try:
         types = worker_cfg.types.split(",") if worker_cfg.types else None
-        while True:
-            handled = await worker.run_once(
-                handler=lambda job, payload: transcribe_handler(
-                    verbatim_service,
-                    mlx_service,
-                    job,
-                    payload,
-                    transcription_cfg.language,
-                    _normalize_backend(job.get("metadata", {}).get("backend", worker_cfg.backend)),
-                    job.get("metadata", {}).get("strategy", worker_cfg.strategy),
-                    diarization_service,
-                    diarization_cfg.enabled
-                    and diarization_cfg.speakers not in (1, "1")
-                    and _normalize_backend(job.get("metadata", {}).get("backend", worker_cfg.backend)) != "mlx-vibevoice",
-                    verbatim_cfg_args,
-                    output_formats,
-                    status_poster,
-                    worker_cfg.status_include_utterance,
-                    worker_cfg.status_watchdog_seconds,
-                ),
-                types=types,
-                max_wait_seconds=worker_cfg.max_wait_seconds,
+        effective_concurrency = 1 if worker_cfg.once else worker_cfg.concurrency
+        logging.info(
+            "worker starting: backend=%s model=%s concurrency=%s",
+            transcription_cfg.backend,
+            transcription_cfg.model,
+            effective_concurrency,
+        )
+
+        async def _handle_job(job: JobClaim, payload: bytes) -> Tuple[bytes, Optional[str]]:
+            backend = _normalize_backend(job.get("metadata", {}).get("backend", worker_cfg.backend))
+            return await transcribe_handler(
+                verbatim_service,
+                mlx_service,
+                job,
+                payload,
+                transcription_cfg.language,
+                backend,
+                job.get("metadata", {}).get("strategy", worker_cfg.strategy),
+                diarization_service,
+                diarization_cfg.enabled
+                and diarization_cfg.speakers not in (1, "1")
+                and backend != "mlx-vibevoice",
+                verbatim_cfg_args,
+                output_formats,
+                status_poster,
+                worker_cfg.status_include_utterance,
+                worker_cfg.status_watchdog_seconds,
             )
-            if handled and worker_cfg.once:
-                return 0
+
+        async def _worker_loop(slot: int) -> None:
+            while True:
+                handled = await worker.run_once(
+                    handler=_handle_job,
+                    types=types,
+                    max_wait_seconds=worker_cfg.max_wait_seconds,
+                )
+                if handled and worker_cfg.once:
+                    logging.info("worker slot %s handled one job; exiting due to --once", slot)
+                    return
+
+        await asyncio.gather(*(_worker_loop(slot) for slot in range(effective_concurrency)))
     finally:
         if status_poster:
             await status_poster.stop()
@@ -1308,6 +1356,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--client-key", default=None)
     parser.add_argument("--types", default=None, help="comma-separated job types")
     parser.add_argument("--max-wait-seconds", type=int, default=None)
+    parser.add_argument("--concurrency", type=int, default=None, help="number of concurrent job workers")
     parser.add_argument("--once", action="store_true", default=None, help="exit after handling one job")
     parser.add_argument("--model", default=None, help="whisper model size or path")
     parser.add_argument("--device", default=None, help="whisper device: auto|cpu|cuda|mps")
