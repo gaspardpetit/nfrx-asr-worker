@@ -512,7 +512,12 @@ def _apply_job_config(
 
     diarize = _normalize_optional_str(job_cfg.get("diarize"))
     if diarize is not None:
-        args.diarize = diarize
+        if diarize.strip().lower() in ("none", "off", "false", "0", "disable", "disabled"):
+            args.diarize = None
+            args.diarize_policy = None
+            args.diarization = None
+        else:
+            args.diarize = diarize
 
     output_cfg = job_cfg.get("output") if isinstance(job_cfg.get("output"), dict) else {}
     output_files = _normalize_string_list(output_cfg.get("files"))
@@ -570,6 +575,20 @@ def _resolve_int(value: Any, default: Optional[int] = None) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _redact_job_config(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key.lower() in ("huggingface_token", "token", "api_key", "apikey", "client_key"):
+                redacted[key] = "***"
+            else:
+                redacted[key] = _redact_job_config(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_job_config(item) for item in value]
+    return value
 
 
 def _resolve_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -915,12 +934,15 @@ async def transcribe_handler(
         if job_cfg is not None and not isinstance(job_cfg, dict):
             logging.warning("job config ignored; expected mapping but got %s", type(job_cfg).__name__)
             job_cfg = None
+        if job_cfg:
+            logging.info("job config: %s", _redact_job_config(job_cfg))
 
         job_args, output_files, output_formats, job_write_config = _apply_job_config(
             base_verbatim_args, job_cfg or {}
         )
         if output_formats is None:
             output_formats = base_output_formats
+        job_language = getattr(job_args, "languages", None) or language
 
         output_format = _output_format_from_formats(output_formats)
         write_config = job_write_config or verbatim_service._write_config
@@ -938,7 +960,7 @@ async def transcribe_handler(
             verbatim_service.transcribe_bytes,
             payload,
             input_label,
-            language,
+            job_language,
             source_config,
             status_hook,
         )
