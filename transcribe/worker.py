@@ -8,7 +8,9 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypedDict
@@ -71,6 +73,7 @@ class DiarizationConfig:
 
 @dataclass
 class TranscriptionConfig:
+    backend: str = "auto"  # auto|verbatim|mlx-vibevoice
     model: str = "large-v3"
     device: str = "auto"
     compute_type: str = "int8"
@@ -88,6 +91,7 @@ class WorkerConfig:
     max_wait_seconds: int = 30
     once: bool = False
     log_level: str = "INFO"
+    backend: str = "auto"  # auto|verbatim|mlx-vibevoice
     strategy: str = "verbatim"  # verbatim|fast
     status_progress: bool = True
     status_interval_seconds: float = 2.0
@@ -558,6 +562,25 @@ def _resolve_device(device: str) -> str:
     return device
 
 
+def _default_backend() -> str:
+    return "mlx-vibevoice" if platform.system() == "Darwin" else "verbatim"
+
+
+def _normalize_backend(value: Any) -> str:
+    backend = str(value or "").strip().lower()
+    if backend in ("", "auto"):
+        return _default_backend()
+    if backend in ("verbatim", "mlx-vibevoice"):
+        return backend
+    raise ValueError(f"unsupported backend: {value}")
+
+
+def _default_model_for_backend(backend: str) -> str:
+    if backend == "mlx-vibevoice":
+        return "mlx-community/VibeVoice-ASR-4bit"
+    return "large-v3"
+
+
 def _resolve_bool(cli: Optional[bool], cfg: Any, env: Optional[str], default: bool) -> bool:
     if cli is not None:
         return bool(cli)
@@ -875,6 +898,77 @@ class FastWhisperService:
         return "".join(text_parts).strip(), segment_list, utterances
 
 
+class MlxVibeVoiceService:
+    def __init__(self, config: TranscriptionConfig) -> None:
+        self._config = config
+        self._model: Any = None
+
+    def _get_model(self) -> Any:
+        if self._model is not None:
+            return self._model
+        if platform.system() != "Darwin":
+            raise RuntimeError("MLX backend requires macOS.")
+        try:
+            from mlx_audio.stt.utils import load as load_model
+        except ImportError:
+            try:
+                from mlx_audio.stt.utils import load_model  # type: ignore[attr-defined]
+            except ImportError as exc:
+                raise RuntimeError(
+                    "MLX backend requires mlx-audio. Install it on macOS before selecting the MLX backend."
+                ) from exc
+        logging.info("loading MLX VibeVoice model: %s", self._config.model)
+        self._model = load_model(self._config.model)
+        return self._model
+
+    def transcribe_file(
+        self,
+        path: str,
+        language: Optional[list[str]],
+    ) -> Tuple[str, list[Dict[str, Any]], list[Utterance]]:
+        if language:
+            logging.info("MLX VibeVoice ignores explicit language selection; using model auto-detection.")
+        result = self._get_model().generate(audio=path, max_tokens=8192, temperature=0.0)
+        raw_segments = getattr(result, "segments", None) or []
+        segments: list[Dict[str, Any]] = []
+        for seg in raw_segments:
+            start = seg.get("start_time", seg.get("Start", 0.0))
+            end = seg.get("end_time", seg.get("End", start))
+            speaker = seg.get("speaker_id", seg.get("Speaker"))
+            text = seg.get("text", seg.get("Content", ""))
+            normalized: Dict[str, Any] = {
+                "start": float(start),
+                "end": float(end),
+                "text": str(text).strip(),
+            }
+            if speaker is not None:
+                normalized["speaker"] = str(speaker)
+            segments.append(normalized)
+        text = (getattr(result, "text", None) or " ".join(seg["text"] for seg in segments)).strip()
+        utterances = _segments_to_utterances(segments, language)
+        return text, segments, utterances
+
+    def transcribe_bytes(
+        self,
+        payload: bytes,
+        input_label: str,
+        language: Optional[list[str]],
+    ) -> Tuple[str, list[Dict[str, Any]], list[Utterance]]:
+        suffix = os.path.splitext(input_label)[1] or ".wav"
+        temp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+                handle.write(payload)
+                temp_path = handle.name
+            return self.transcribe_file(temp_path, language)
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    logging.warning("failed to delete temporary MLX input file: %s", temp_path)
+
+
 def _segments_to_utterances(segments: list[Dict[str, Any]], languages: Optional[list[str]]) -> list[Utterance]:
     lang = languages[0] if languages else "en"
     utterances: list[Utterance] = []
@@ -905,11 +999,12 @@ def _segments_to_utterances(segments: list[Dict[str, Any]], languages: Optional[
 
 async def transcribe_handler(
     verbatim_service: VerbatimService,
+    mlx_service: MlxVibeVoiceService,
     job: JobClaim,
     payload: bytes,
     language: Optional[list[str]],
+    backend: str,
     strategy: str,
-    fast_service: FastWhisperService,
     diarization_service: DiarizationService,
     diarize_enabled: bool,
     base_verbatim_args: argparse.Namespace,
@@ -929,6 +1024,8 @@ async def transcribe_handler(
         content_type = metadata.get("content_type") or metadata.get("mime_type")
         if strategy == "fast":
             return b"", "fast strategy requires file-backed input; temp files are disabled"
+        if backend == "mlx-vibevoice" and diarize_enabled:
+            logging.info("MLX backend selected; external diarization is disabled.")
 
         job_cfg = metadata.get("config")
         if job_cfg is not None and not isinstance(job_cfg, dict):
@@ -956,14 +1053,22 @@ async def transcribe_handler(
         input_label = f"{base}{suffix}"
 
         logging.info("starting transcription (input=%s)", input_label)
-        text, segments, utterances = await asyncio.to_thread(
-            verbatim_service.transcribe_bytes,
-            payload,
-            input_label,
-            job_language,
-            source_config,
-            status_hook,
-        )
+        if backend == "mlx-vibevoice":
+            text, segments, utterances = await asyncio.to_thread(
+                mlx_service.transcribe_bytes,
+                payload,
+                input_label,
+                job_language,
+            )
+        else:
+            text, segments, utterances = await asyncio.to_thread(
+                verbatim_service.transcribe_bytes,
+                payload,
+                input_label,
+                job_language,
+                source_config,
+                status_hook,
+            )
         if output_format == "text":
             if utterances is not None:
                 formatted = _format_text_output(utterances, write_config)
@@ -1019,6 +1124,9 @@ async def run(args: argparse.Namespace) -> int:
         ),
         once=_resolve_bool(args.once, _cfg_get(config_data, "worker", "once"), os.environ.get("NFRX_ONCE"), False),
         log_level=_resolve(args.log_level, _cfg_get(config_data, "worker", "log_level"), os.environ.get("LOG_LEVEL"), "INFO"),
+        backend=_normalize_backend(
+            _resolve(args.backend, _cfg_get(config_data, "worker", "backend"), os.environ.get("ASR_BACKEND"), "auto")
+        ),
         strategy=_resolve(args.strategy, _cfg_get(config_data, "worker", "strategy"), os.environ.get("ASR_STRATEGY"), "verbatim"),
         status_progress=_resolve_bool(
             args.status_progress,
@@ -1104,8 +1212,17 @@ async def run(args: argparse.Namespace) -> int:
         os.environ.get("WHISPER_DEVICE"),
         "cpu" if getattr(verbatim_cfg_args, "cpu", False) else "auto",
     )
+    resolved_backend = _normalize_backend(
+        _resolve(args.backend, _cfg_get(config_data, "worker", "backend"), os.environ.get("ASR_BACKEND"), "auto")
+    )
     transcription_cfg = TranscriptionConfig(
-        model=_resolve(args.model, _cfg_get_transcription(config_data, "model"), os.environ.get("WHISPER_MODEL"), "large-v3"),
+        backend=resolved_backend,
+        model=_resolve(
+            args.model,
+            _cfg_get_transcription(config_data, "model"),
+            os.environ.get("WHISPER_MODEL"),
+            _default_model_for_backend(resolved_backend),
+        ),
         device=_resolve_device(resolved_device),
         language=_normalize_languages(
             _resolve(
@@ -1149,7 +1266,7 @@ async def run(args: argparse.Namespace) -> int:
         )
         status_poster.start(asyncio.get_running_loop())
     verbatim_service = VerbatimService(transcription_cfg, diarization_cfg, source_config, write_config)
-    fast_service = FastWhisperService(transcription_cfg)
+    mlx_service = MlxVibeVoiceService(transcription_cfg)
     diarization_service = DiarizationService(diarization_cfg, transcription_cfg.device)
     try:
         types = worker_cfg.types.split(",") if worker_cfg.types else None
@@ -1157,13 +1274,16 @@ async def run(args: argparse.Namespace) -> int:
             handled = await worker.run_once(
                 handler=lambda job, payload: transcribe_handler(
                     verbatim_service,
+                    mlx_service,
                     job,
                     payload,
                     transcription_cfg.language,
+                    _normalize_backend(job.get("metadata", {}).get("backend", worker_cfg.backend)),
                     job.get("metadata", {}).get("strategy", worker_cfg.strategy),
-                    fast_service,
                     diarization_service,
-                    diarization_cfg.enabled and diarization_cfg.speakers not in (1, "1"),
+                    diarization_cfg.enabled
+                    and diarization_cfg.speakers not in (1, "1")
+                    and _normalize_backend(job.get("metadata", {}).get("backend", worker_cfg.backend)) != "mlx-vibevoice",
                     verbatim_cfg_args,
                     output_formats,
                     status_poster,
@@ -1192,6 +1312,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None, help="whisper model size or path")
     parser.add_argument("--device", default=None, help="whisper device: auto|cpu|cuda|mps")
     parser.add_argument("--compute-type", default=None, help="unused (kept for compatibility)")
+    parser.add_argument("--backend", default=None, help="backend: auto|verbatim|mlx-vibevoice")
     parser.add_argument("--strategy", default=None, help="transcription strategy: verbatim|fast")
     parser.add_argument("--language", default=None)
     parser.add_argument("--beam-size", default=None, type=int)
