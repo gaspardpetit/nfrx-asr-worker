@@ -9,16 +9,18 @@ import json
 import logging
 import os
 import platform
+import re
 import sys
-import tempfile
 import time
-import wave
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypedDict
 
 import httpx
 from dotenv import load_dotenv
+
+from transcribe.audio import AudioBuffer, AudioDecodeError, normalize_audio_buffer, slice_audio_buffer
+from transcribe.speaker_embeddings import IncrementalSpeakerResolver, warmup_default_speaker_embedder
 
 _VERBATIM_MODULES: Optional[SimpleNamespace] = None
 _VERBATIM_IMPORT_ERROR: Optional[Exception] = None
@@ -131,6 +133,10 @@ class TranscriptionConfig:
     best_of: Optional[int] = None
     patience: Optional[float] = None
     output_format: str = "json"  # json|text
+    mlx_max_tokens: int = 32768
+    mlx_chunk_seconds: float = 20.0 * 60.0
+    mlx_chunk_overlap_seconds: float = 60.0
+    mlx_context_characters: int = 8000
 
 
 @dataclass
@@ -559,7 +565,7 @@ def _status_update_to_payload(update: Any, include_utterance: bool) -> Optional[
         if utterance is not None:
             utterance_payload: Dict[str, Any] = {
                 "text": getattr(utterance, "text", None),
-                "speaker": getattr(utterance, "speaker", None),
+                "speaker": _public_speaker_label(getattr(utterance, "speaker", None)),
             }
             if hasattr(utterance, "get_start"):
                 utterance_payload["start"] = float(utterance.get_start())
@@ -768,18 +774,44 @@ def _format_text_from_segments(segments: list[Dict[str, Any]]) -> str:
         if current_minute is None or minute != current_minute:
             current_minute = minute
             lines.append(f"[{minute:02d}:00]")
-        speaker = seg.get("speaker") or "SPEAKER"
+        speaker = _public_segment_speaker(seg) or "SPEAKER"
         text = (seg.get("text") or "").strip()
         if text:
             lines.append(f"[{speaker}] {text}")
     return "\n".join(lines).strip()
 
 
+def _public_speaker_label(speaker: Any) -> Optional[str]:
+    if speaker is None:
+        return None
+    label = str(speaker).strip()
+    if not label:
+        return None
+    upper = label.upper()
+    if upper == "UNKNOWN":
+        return None
+    match = re.fullmatch(r"SPEAKER_(\d+)", upper)
+    if match:
+        return str(int(match.group(1)))
+    if re.fullmatch(r"\d+", label):
+        return str(int(label))
+    return None
+
+
+def _public_segment_speaker(segment: Dict[str, Any]) -> Optional[str]:
+    speaker = segment.get("speaker")
+    if "_chunk_index" in segment or "_local_speaker" in segment:
+        label = str(speaker or "").strip()
+        if not re.fullmatch(r"SPEAKER_\d+", label, re.IGNORECASE):
+            return None
+    return _public_speaker_label(speaker)
+
+
 def _format_jsonl_output(segments: list[Dict[str, Any]]) -> bytes:
     lines: list[str] = []
     for seg in segments:
         payload = {
-            "speaker": seg.get("speaker"),
+            "speaker": _public_segment_speaker(seg),
             "start": float(seg.get("start", 0.0)),
             "end": float(seg.get("end", seg.get("start", 0.0))),
             "text": (seg.get("text") or "").strip(),
@@ -789,6 +821,388 @@ def _format_jsonl_output(segments: list[Dict[str, Any]]) -> bytes:
     if text:
         text += "\n"
     return text.encode("utf-8")
+
+
+def _public_segments(segments: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    public_segments: list[Dict[str, Any]] = []
+    for seg in segments:
+        updated = dict(seg)
+        updated["speaker"] = _public_segment_speaker(seg)
+        public_segments.append(updated)
+    return public_segments
+
+
+def _segments_to_plain_text(segments: list[Dict[str, Any]]) -> str:
+    return " ".join((seg.get("text") or "").strip() for seg in segments if (seg.get("text") or "").strip()).strip()
+
+
+def _normalize_alignment_text(text: str) -> str:
+    text = (text or "").lower()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _levenshtein_distance(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    if len(a) < len(b):
+        a, b = b, a
+    previous = list(range(len(b) + 1))
+    for i, char_a in enumerate(a, start=1):
+        current = [i]
+        for j, char_b in enumerate(b, start=1):
+            insertion = current[j - 1] + 1
+            deletion = previous[j] + 1
+            substitution = previous[j - 1] + (char_a != char_b)
+            current.append(min(insertion, deletion, substitution))
+        previous = current
+    return previous[-1]
+
+
+def _levenshtein_similarity(a: str, b: str) -> float:
+    norm_a = _normalize_alignment_text(a)
+    norm_b = _normalize_alignment_text(b)
+    if not norm_a and not norm_b:
+        return 1.0
+    if not norm_a or not norm_b:
+        return 0.0
+    distance = _levenshtein_distance(norm_a, norm_b)
+    return max(0.0, 1.0 - (distance / max(len(norm_a), len(norm_b))))
+
+
+def _segment_overlap_ratio(left: Dict[str, Any], right: Dict[str, Any]) -> float:
+    left_start = float(left.get("start", 0.0))
+    left_end = float(left.get("end", left_start))
+    right_start = float(right.get("start", 0.0))
+    right_end = float(right.get("end", right_start))
+    overlap = max(0.0, min(left_end, right_end) - max(left_start, right_start))
+    if overlap <= 0:
+        return 0.0
+    left_duration = max(0.001, left_end - left_start)
+    right_duration = max(0.001, right_end - right_start)
+    return overlap / max(left_duration, right_duration)
+
+
+def _resolved_alignment_speaker(segment: Dict[str, Any]) -> Optional[str]:
+    speaker = segment.get("speaker")
+    if speaker is None:
+        return None
+    label = str(speaker).strip()
+    if not label:
+        return None
+    if re.fullmatch(r"SPEAKER_\d+", label, re.IGNORECASE):
+        return label.upper()
+    return None
+
+
+def _segment_alignment_score(left: Dict[str, Any], right: Dict[str, Any]) -> float:
+    text_score = _levenshtein_similarity(str(left.get("text") or ""), str(right.get("text") or ""))
+    time_score = _segment_overlap_ratio(left, right)
+    if text_score < 0.45 and time_score < 0.45:
+        return 0.0
+    left_speaker = _resolved_alignment_speaker(left)
+    right_speaker = _resolved_alignment_speaker(right)
+    if left_speaker is not None and right_speaker is not None and left_speaker != right_speaker:
+        return 0.0
+    score = text_score * 0.7 + time_score * 0.3
+    if left_speaker is not None and right_speaker is not None and left_speaker == right_speaker:
+        score += 0.15
+    return min(score, 1.0)
+
+
+def _is_more_complete_text(candidate: str, baseline: str) -> bool:
+    candidate_norm = _normalize_alignment_text(candidate)
+    baseline_norm = _normalize_alignment_text(baseline)
+    if not candidate_norm or not baseline_norm:
+        return False
+    if len(candidate_norm) <= len(baseline_norm):
+        return False
+    prefix = candidate_norm[: len(baseline_norm)]
+    return _levenshtein_similarity(prefix, baseline_norm) >= 0.85
+
+
+def _align_overlap_segments(
+    previous_overlap: list[Dict[str, Any]],
+    current_overlap: list[Dict[str, Any]],
+) -> list[tuple[int, int, float]]:
+    if not previous_overlap or not current_overlap:
+        return []
+
+    prev_len = len(previous_overlap)
+    curr_len = len(current_overlap)
+    scores = [[0.0] * (curr_len + 1) for _ in range(prev_len + 1)]
+    trace: list[list[tuple[str, float]]] = [[("", 0.0)] * (curr_len + 1) for _ in range(prev_len + 1)]
+
+    for i in range(1, prev_len + 1):
+        for j in range(1, curr_len + 1):
+            best_score = scores[i - 1][j]
+            best_trace = ("up", 0.0)
+
+            if scores[i][j - 1] > best_score:
+                best_score = scores[i][j - 1]
+                best_trace = ("left", 0.0)
+
+            match_score = _segment_alignment_score(previous_overlap[i - 1], current_overlap[j - 1])
+            if match_score > 0:
+                diagonal_score = scores[i - 1][j - 1] + match_score
+                if diagonal_score >= best_score:
+                    best_score = diagonal_score
+                    best_trace = ("diag", match_score)
+
+            scores[i][j] = best_score
+            trace[i][j] = best_trace
+
+    matches: list[tuple[int, int, float]] = []
+    i = prev_len
+    j = curr_len
+    while i > 0 and j > 0:
+        direction, match_score = trace[i][j]
+        if direction == "diag" and match_score > 0:
+            matches.append((i - 1, j - 1, match_score))
+            i -= 1
+            j -= 1
+        elif direction == "left":
+            j -= 1
+        else:
+            i -= 1
+    matches.reverse()
+    return matches
+
+
+def _edge_confidence(segment: Dict[str, Any], overlap_start: float, overlap_end: float, prefer_previous: bool) -> float:
+    midpoint = (float(segment.get("start", 0.0)) + float(segment.get("end", segment.get("start", 0.0)))) / 2.0
+    if prefer_previous:
+        return max(0.0, overlap_end - midpoint)
+    return max(0.0, midpoint - overlap_start)
+
+
+def _merge_chunk_segments(
+    previous_segments: list[Dict[str, Any]],
+    current_segments: list[Dict[str, Any]],
+    overlap_start: float,
+    overlap_end: float,
+) -> list[Dict[str, Any]]:
+    if not previous_segments:
+        return list(current_segments)
+    if not current_segments:
+        return list(previous_segments)
+
+    previous_overlap_indices = [idx for idx, seg in enumerate(previous_segments) if float(seg.get("end", seg.get("start", 0.0))) > overlap_start]
+    current_overlap_indices = [idx for idx, seg in enumerate(current_segments) if float(seg.get("start", 0.0)) < overlap_end]
+
+    previous_overlap = [previous_segments[idx] for idx in previous_overlap_indices]
+    current_overlap = [current_segments[idx] for idx in current_overlap_indices]
+    matches = _align_overlap_segments(previous_overlap, current_overlap)
+
+    drop_previous: set[int] = set()
+    drop_current: set[int] = set()
+    for prev_local_idx, curr_local_idx, score in matches:
+        prev_idx = previous_overlap_indices[prev_local_idx]
+        curr_idx = current_overlap_indices[curr_local_idx]
+        prev_seg = previous_segments[prev_idx]
+        curr_seg = current_segments[curr_idx]
+
+        prev_conf = _edge_confidence(prev_seg, overlap_start, overlap_end, prefer_previous=True)
+        curr_conf = _edge_confidence(curr_seg, overlap_start, overlap_end, prefer_previous=False)
+        prev_text = str(prev_seg.get("text") or "")
+        curr_text = str(curr_seg.get("text") or "")
+        if _is_more_complete_text(curr_text, prev_text) and score >= 0.55:
+            drop_previous.add(prev_idx)
+        elif _is_more_complete_text(prev_text, curr_text) and score >= 0.55:
+            drop_current.add(curr_idx)
+        elif curr_conf > prev_conf and score >= 0.55:
+            drop_previous.add(prev_idx)
+        else:
+            drop_current.add(curr_idx)
+
+    for curr_idx in current_overlap_indices:
+        if curr_idx in drop_current:
+            continue
+        curr_seg = current_segments[curr_idx]
+        for prev_idx in previous_overlap_indices:
+            if prev_idx in drop_previous:
+                continue
+            prev_seg = previous_segments[prev_idx]
+            score = _segment_alignment_score(prev_seg, curr_seg)
+            if score >= 0.82:
+                drop_current.add(curr_idx)
+                break
+
+    merged = [seg for idx, seg in enumerate(previous_segments) if idx not in drop_previous]
+    merged.extend(seg for idx, seg in enumerate(current_segments) if idx not in drop_current)
+    merged.sort(key=lambda seg: (float(seg.get("start", 0.0)), float(seg.get("end", seg.get("start", 0.0)))))
+    return merged
+
+
+def _segment_midpoint(segment: Dict[str, Any]) -> float:
+    start = float(segment.get("start", 0.0))
+    end = float(segment.get("end", start))
+    return (start + end) / 2.0
+
+
+def _resolve_overlap_window(
+    previous_overlap: list[Dict[str, Any]],
+    current_overlap: list[Dict[str, Any]],
+    overlap_start: float,
+    overlap_end: float,
+) -> list[Dict[str, Any]]:
+    if not previous_overlap and not current_overlap:
+        return []
+    if not previous_overlap:
+        return list(current_overlap)
+    if not current_overlap:
+        return list(previous_overlap)
+
+    midpoint = overlap_start + ((overlap_end - overlap_start) / 2.0)
+    previous_indices = list(range(len(previous_overlap)))
+    current_indices = list(range(len(current_overlap)))
+    matches = _align_overlap_segments(previous_overlap, current_overlap)
+
+    consumed_previous: set[int] = set()
+    consumed_current: set[int] = set()
+    resolved: list[Dict[str, Any]] = []
+
+    for prev_idx, curr_idx, _score in matches:
+        consumed_previous.add(prev_idx)
+        consumed_current.add(curr_idx)
+        previous_seg = previous_overlap[prev_idx]
+        current_seg = current_overlap[curr_idx]
+        previous_text = str(previous_seg.get("text") or "")
+        current_text = str(current_seg.get("text") or "")
+        if _normalize_alignment_text(previous_text) == _normalize_alignment_text(current_text):
+            chosen = previous_seg if _segment_midpoint(previous_seg) <= midpoint else current_seg
+        elif _segment_midpoint(previous_seg) < midpoint:
+            chosen = previous_seg
+        else:
+            chosen = current_seg
+        resolved.append(chosen)
+
+    # Preserve unmatched overlap speech from both sides; for online updates it is
+    # better to dedupe later than to silently drop a real utterance.
+    for prev_idx in previous_indices:
+        if prev_idx in consumed_previous:
+            continue
+        resolved.append(previous_overlap[prev_idx])
+
+    for curr_idx in current_indices:
+        if curr_idx in consumed_current:
+            continue
+        resolved.append(current_overlap[curr_idx])
+
+    resolved.sort(key=lambda seg: (float(seg.get("start", 0.0)), float(seg.get("end", seg.get("start", 0.0)))))
+
+    deduped: list[Dict[str, Any]] = []
+    for seg in resolved:
+        if deduped and _segment_alignment_score(deduped[-1], seg) >= 0.9:
+            continue
+        deduped.append(seg)
+    return deduped
+
+
+def _status_payload_from_segment(segment: Dict[str, Any], finish: Optional[float]) -> StatusPayload:
+    end = float(segment.get("end", segment.get("start", 0.0)))
+    progress: Dict[str, Any] = {"current": round(end, 2), "units": "seconds"}
+    if finish is not None:
+        progress["finish"] = round(finish, 2)
+        if finish > 0:
+            progress["percent"] = round(max(0.0, min(100.0, (end / finish) * 100.0)), 1)
+    payload: StatusPayload = {
+        "phase": "transcribing",
+        "progress": progress,
+        "utterance": {
+            "text": str(segment.get("text") or "").strip(),
+            "speaker": _public_segment_speaker(segment),
+            "start": round(float(segment.get("start", 0.0)), 2),
+            "end": round(end, 2),
+        },
+    }
+    return payload
+
+
+class ChunkResolvedEmitter:
+    def __init__(
+        self,
+        *,
+        overlap_seconds: float,
+        finish: Optional[float],
+        status_hook: Optional[Callable[[Any], None]],
+        segment_transformer: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        segment_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+        self._overlap_seconds = max(0.0, overlap_seconds)
+        self._finish = finish
+        self._status_hook = status_hook
+        self._segment_transformer = segment_transformer
+        self._segment_observer = segment_observer
+        self._pending_tail: list[Dict[str, Any]] = []
+        self._emitted: list[Dict[str, Any]] = []
+
+    def _emit(self, segments: list[Dict[str, Any]]) -> None:
+        if not segments:
+            return
+        emitted_segments: list[Dict[str, Any]] = []
+        for segment in segments:
+            resolved = dict(segment)
+            if self._segment_transformer is not None:
+                resolved = self._segment_transformer(resolved)
+            emitted_segments.append(resolved)
+            if self._segment_observer is not None:
+                self._segment_observer(dict(resolved))
+        self._emitted.extend(emitted_segments)
+        if self._status_hook is None:
+            return
+        for segment in emitted_segments:
+            self._status_hook(_status_payload_from_segment(segment, self._finish))
+
+    def process_chunk(
+        self,
+        segments: list[Dict[str, Any]],
+        *,
+        chunk_start: float,
+        chunk_end: float,
+        is_last: bool,
+    ) -> None:
+        if self._overlap_seconds <= 0:
+            self._emit(segments)
+            return
+
+        overlap_end = min(chunk_end, chunk_start + self._overlap_seconds)
+        current_head = [seg for seg in segments if float(seg.get("start", 0.0)) < overlap_end]
+        current_body = [seg for seg in segments if float(seg.get("start", 0.0)) >= overlap_end]
+
+        first_non_overlap: list[Dict[str, Any]] = []
+        if self._pending_tail:
+            resolved_overlap = _resolve_overlap_window(self._pending_tail, current_head, chunk_start, overlap_end)
+            self._emit(resolved_overlap)
+        else:
+            first_non_overlap = [seg for seg in segments if float(seg.get("end", seg.get("start", 0.0))) <= max(chunk_end - self._overlap_seconds, 0.0)]
+            self._emit(first_non_overlap)
+
+        if is_last:
+            if not self._pending_tail:
+                trailing = [seg for seg in segments if seg not in first_non_overlap]
+                self._emit(trailing)
+            else:
+                self._emit(current_body)
+            self._pending_tail = []
+            return
+
+        tail_start = max(chunk_start, chunk_end - self._overlap_seconds)
+        current_non_overlap = [
+            seg for seg in segments if float(seg.get("start", 0.0)) >= overlap_end and float(seg.get("end", seg.get("start", 0.0))) <= tail_start
+        ]
+        self._emit(current_non_overlap)
+        self._pending_tail = [seg for seg in segments if float(seg.get("end", seg.get("start", 0.0))) > tail_start]
+
+    def finalize(self) -> None:
+        if self._pending_tail:
+            self._emit(self._pending_tail)
+            self._pending_tail = []
 
 
 class VerbatimService:
@@ -1054,6 +1468,9 @@ class MlxVibeVoiceService:
         self._model = load_model(self._config.model)
         return self._model
 
+    def warmup(self) -> None:
+        self._get_model()
+
     @staticmethod
     def _coerce_float(value: Any) -> Optional[float]:
         if value is None:
@@ -1129,29 +1546,36 @@ class MlxVibeVoiceService:
             normalized["speaker"] = str(speaker)
         return normalized
 
-    @classmethod
-    def _estimate_audio_duration(cls, path: str) -> Optional[float]:
-        try:
-            with wave.open(path, "rb") as wav_file:
-                frame_rate = wav_file.getframerate()
-                frame_count = wav_file.getnframes()
-                if frame_rate > 0:
-                    return frame_count / float(frame_rate)
-        except Exception:
-            pass
-
-        try:
-            import soundfile as sf
-        except ImportError:
+    def _build_context(self, previous_text: str) -> Optional[str]:
+        context = (previous_text or "").strip()
+        if not context:
             return None
+        if self._config.mlx_context_characters > 0:
+            context = context[-self._config.mlx_context_characters :]
+        return (
+            "Use this prior transcript for continuity of names, terminology, and topic. "
+            "Preserve consistent wording when it fits the audio.\n\n"
+            f"{context}"
+        )
 
-        try:
-            info = sf.info(path)
-        except Exception:
-            return None
-        if getattr(info, "samplerate", 0) and getattr(info, "frames", 0):
-            return float(info.frames) / float(info.samplerate)
-        return None
+    @staticmethod
+    def _iter_chunk_windows(duration_seconds: float, chunk_seconds: float, overlap_seconds: float) -> list[tuple[float, float]]:
+        if duration_seconds <= 0:
+            return []
+        if chunk_seconds <= 0 or duration_seconds <= chunk_seconds:
+            return [(0.0, duration_seconds)]
+        stride = chunk_seconds - max(0.0, min(overlap_seconds, chunk_seconds - 1.0))
+        if stride <= 0:
+            stride = chunk_seconds
+        windows: list[tuple[float, float]] = []
+        start = 0.0
+        while start < duration_seconds:
+            end = min(duration_seconds, start + chunk_seconds)
+            windows.append((start, end))
+            if end >= duration_seconds:
+                break
+            start += stride
+        return windows
 
     @staticmethod
     def _iter_json_objects(buffer: str) -> tuple[list[Dict[str, Any]], str]:
@@ -1203,18 +1627,29 @@ class MlxVibeVoiceService:
     def _stream_transcribe(
         self,
         model: Any,
-        path: str,
+        audio: AudioBuffer,
+        context: Optional[str],
         status_hook: Optional[Callable[[Any], None]],
+        progress_offset: float = 0.0,
+        progress_finish: Optional[float] = None,
+        emit_utterances: bool = True,
     ) -> list[Dict[str, Any]]:
         segments: list[Dict[str, Any]] = []
         stream_transcribe = getattr(model, "stream_transcribe", None)
         if not callable(stream_transcribe):
             return segments
+        if audio.samples.size == 0:
+            raise AudioDecodeError("cannot stream-transcribe an empty audio buffer")
 
         try:
             buffer = ""
-            estimated_finish = self._estimate_audio_duration(path)
-            for chunk in stream_transcribe(audio=path, max_tokens=4096):
+            estimated_finish = progress_finish if progress_finish is not None else audio.duration_seconds
+            for chunk in stream_transcribe(
+                audio=audio.samples,
+                sampling_rate=audio.sample_rate,
+                context=context,
+                max_tokens=self._config.mlx_max_tokens,
+            ):
                 if isinstance(chunk, str):
                     buffer += chunk
                     objects, buffer = self._iter_json_objects(buffer)
@@ -1222,18 +1657,121 @@ class MlxVibeVoiceService:
                         for obj in objects:
                             normalized = self._normalize_segment(obj)
                             if normalized is not None:
+                                normalized["start"] = round(normalized["start"] + progress_offset, 2)
+                                normalized["end"] = round(normalized["end"] + progress_offset, 2)
                                 segments.append(normalized)
                             payload = self._extract_stream_status(obj, estimated_finish)
+                            if payload and progress_offset:
+                                progress = payload.get("progress")
+                                if isinstance(progress, dict) and "current" in progress:
+                                    progress["current"] = round(float(progress["current"]) + progress_offset, 2)
+                                    if estimated_finish is not None:
+                                        progress["finish"] = round(estimated_finish, 2)
+                                        if estimated_finish > 0:
+                                            progress["percent"] = round(
+                                                max(0.0, min(100.0, (float(progress["current"]) / estimated_finish) * 100.0)),
+                                                1,
+                                            )
+                            if payload and not emit_utterances:
+                                payload.pop("utterance", None)
                             if payload and status_hook is not None:
                                 status_hook(payload)
                     continue
                 payload = self._extract_stream_status(chunk, estimated_finish)
+                if payload and progress_offset:
+                    progress = payload.get("progress")
+                    if isinstance(progress, dict) and "current" in progress:
+                        progress["current"] = round(float(progress["current"]) + progress_offset, 2)
+                        if estimated_finish is not None:
+                            progress["finish"] = round(estimated_finish, 2)
+                            if estimated_finish > 0:
+                                progress["percent"] = round(
+                                    max(0.0, min(100.0, (float(progress["current"]) / estimated_finish) * 100.0)),
+                                    1,
+                                )
+                if payload and not emit_utterances:
+                    payload.pop("utterance", None)
                 if payload and status_hook is not None:
                     status_hook(payload)
+        except AudioDecodeError:
+            raise
         except Exception:
-            logging.exception("MLX VibeVoice streaming status failed; continuing with final generate() result")
+            logging.exception(
+                "MLX VibeVoice streaming status failed; continuing with final generate() result "
+                "(samples=%s sample_rate=%s duration=%.3fs offset=%.3fs)",
+                audio.samples.size,
+                audio.sample_rate,
+                audio.duration_seconds,
+                progress_offset,
+            )
             return []
         return segments
+
+    def _transcribe_single_file(
+        self,
+        model: Any,
+        audio: AudioBuffer,
+        language: Optional[list[str]],
+        context: Optional[str],
+        status_hook: Optional[Callable[[Any], None]],
+        progress_offset: float = 0.0,
+        progress_finish: Optional[float] = None,
+        emit_utterances: bool = True,
+    ) -> tuple[str, list[Dict[str, Any]]]:
+        if language:
+            logging.info("MLX VibeVoice ignores explicit language selection; using model auto-detection.")
+        if audio.samples.size == 0:
+            raise AudioDecodeError("cannot transcribe an empty audio buffer")
+        segments = self._stream_transcribe(
+            model,
+            audio,
+            context,
+            status_hook,
+            progress_offset=progress_offset,
+            progress_finish=progress_finish,
+            emit_utterances=emit_utterances,
+        )
+        if segments:
+            return _segments_to_plain_text(segments), segments
+
+        logging.warning(
+            "MLX VibeVoice streaming yielded no segments; falling back to generate() "
+            "(samples=%s sample_rate=%s duration=%.3fs offset=%.3fs context_chars=%s)",
+            audio.samples.size,
+            audio.sample_rate,
+            audio.duration_seconds,
+            progress_offset,
+            len(context or ""),
+        )
+        result = model.generate(
+            audio=audio.samples,
+            sampling_rate=audio.sample_rate,
+            context=context,
+            max_tokens=self._config.mlx_max_tokens,
+            temperature=0.0,
+        )
+        raw_segments = getattr(result, "segments", None) or []
+        if not raw_segments:
+            raw_text = getattr(result, "text", None)
+            if isinstance(raw_text, str):
+                try:
+                    parsed_text = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    parsed_text = None
+                if isinstance(parsed_text, list):
+                    raw_segments = [seg for seg in parsed_text if isinstance(seg, dict)]
+        normalized_segments: list[Dict[str, Any]] = []
+        for seg in raw_segments:
+            normalized = self._normalize_segment(seg)
+            if normalized is None:
+                continue
+            normalized["start"] = round(normalized["start"] + progress_offset, 2)
+            normalized["end"] = round(normalized["end"] + progress_offset, 2)
+            normalized_segments.append(normalized)
+        text = _segments_to_plain_text(normalized_segments)
+        if not text:
+            text = (getattr(result, "text", None) or "").strip()
+        return text, normalized_segments
 
     def transcribe_file(
         self,
@@ -1241,32 +1779,9 @@ class MlxVibeVoiceService:
         language: Optional[list[str]],
         status_hook: Optional[Callable[[Any], None]] = None,
     ) -> Tuple[str, list[Dict[str, Any]], Optional[list[Any]]]:
-        if language:
-            logging.info("MLX VibeVoice ignores explicit language selection; using model auto-detection.")
-        model = self._get_model()
-        segments = self._stream_transcribe(model, path, status_hook)
-        if not segments:
-            result = model.generate(audio=path, max_tokens=8192, temperature=0.0)
-            raw_segments = getattr(result, "segments", None) or []
-            if not raw_segments:
-                raw_text = getattr(result, "text", None)
-                if isinstance(raw_text, str):
-                    try:
-                        parsed_text = json.loads(raw_text)
-                    except json.JSONDecodeError:
-                        parsed_text = None
-                    if isinstance(parsed_text, list):
-                        raw_segments = [seg for seg in parsed_text if isinstance(seg, dict)]
-            segments = []
-            for seg in raw_segments:
-                normalized = self._normalize_segment(seg)
-                if normalized is not None:
-                    segments.append(normalized)
-            text = (getattr(result, "text", None) or " ".join(seg["text"] for seg in segments)).strip()
-        else:
-            text = " ".join(seg["text"] for seg in segments if seg.get("text")).strip()
-        utterances = _segments_to_utterances(segments, language)
-        return text, segments, utterances
+        with open(path, "rb") as handle:
+            payload = handle.read()
+        return self.transcribe_bytes(payload, os.path.basename(path), language, status_hook)
 
     def transcribe_bytes(
         self,
@@ -1275,19 +1790,127 @@ class MlxVibeVoiceService:
         language: Optional[list[str]],
         status_hook: Optional[Callable[[Any], None]] = None,
     ) -> Tuple[str, list[Dict[str, Any]], Optional[list[Any]]]:
-        suffix = os.path.splitext(input_label)[1] or ".wav"
-        temp_path = ""
+        model = self._get_model()
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
-                handle.write(payload)
-                temp_path = handle.name
-            return self.transcribe_file(temp_path, language, status_hook)
+            audio = normalize_audio_buffer(payload, target_sample_rate=24000)
+        except AudioDecodeError as exc:
+            raise AudioDecodeError(
+                f"failed to decode '{input_label}' ({len(payload)} bytes) into MLX audio: {exc}"
+            ) from exc
+        logging.info(
+            "decoded MLX audio input=%s bytes=%s sample_rate=%s samples=%s duration=%.3fs",
+            input_label,
+            len(payload),
+            audio.sample_rate,
+            audio.samples.size,
+            audio.duration_seconds,
+        )
+        total_duration = audio.duration_seconds
+        chunk_seconds = max(0.0, self._config.mlx_chunk_seconds)
+        overlap_seconds = max(0.0, min(self._config.mlx_chunk_overlap_seconds, max(0.0, chunk_seconds - 1.0)))
+        embeddings_enabled = chunk_seconds > 0 and total_duration > chunk_seconds
+        speaker_resolver = IncrementalSpeakerResolver(audio=audio, enabled=embeddings_enabled)
+        try:
+            if chunk_seconds <= 0 or total_duration <= chunk_seconds:
+                text, segments = self._transcribe_single_file(
+                    model,
+                    audio,
+                    language,
+                    context=None,
+                    status_hook=status_hook,
+                    progress_finish=total_duration,
+                    emit_utterances=False,
+                )
+                annotated_segments = [
+                    speaker_resolver.annotate_segment(segment, chunk_index=1)
+                    for segment in segments
+                ]
+                resolved_emitter = ChunkResolvedEmitter(
+                    overlap_seconds=0.0,
+                    finish=total_duration,
+                    status_hook=status_hook,
+                    segment_transformer=speaker_resolver.label_for_emission,
+                    segment_observer=speaker_resolver.observe_emitted_segment,
+                )
+                resolved_emitter.process_chunk(
+                    annotated_segments,
+                    chunk_start=0.0,
+                    chunk_end=total_duration,
+                    is_last=True,
+                )
+                annotated_segments = speaker_resolver.relabel_segments(annotated_segments)
+                utterances = _segments_to_utterances(annotated_segments, language)
+                return _segments_to_plain_text(annotated_segments), annotated_segments, utterances
+
+            windows = self._iter_chunk_windows(total_duration, chunk_seconds, overlap_seconds)
+            logging.info(
+                "chunking MLX transcription into %s windows (chunk=%.1fs overlap=%.1fs max_tokens=%s)",
+                len(windows),
+                chunk_seconds,
+                overlap_seconds,
+                self._config.mlx_max_tokens,
+            )
+
+            merged_segments: list[Dict[str, Any]] = []
+            previous_chunk_text = ""
+            resolved_emitter = ChunkResolvedEmitter(
+                overlap_seconds=overlap_seconds,
+                finish=total_duration,
+                status_hook=status_hook,
+                segment_transformer=speaker_resolver.label_for_emission,
+                segment_observer=speaker_resolver.observe_emitted_segment,
+            )
+            for chunk_index, (chunk_start, chunk_end) in enumerate(windows, start=1):
+                chunk_audio = slice_audio_buffer(audio, chunk_start, chunk_end)
+                context = self._build_context(previous_chunk_text)
+                logging.info(
+                    "transcribing MLX chunk %s/%s start=%.2fs end=%.2fs context_chars=%s samples=%s duration=%.3fs",
+                    chunk_index,
+                    len(windows),
+                    chunk_start,
+                    chunk_end,
+                    len(context or ""),
+                    chunk_audio.samples.size,
+                    chunk_audio.duration_seconds,
+                )
+                chunk_text, chunk_segments = self._transcribe_single_file(
+                    model,
+                    chunk_audio,
+                    language,
+                    context=context,
+                    status_hook=status_hook,
+                    progress_offset=chunk_start,
+                    progress_finish=total_duration,
+                    emit_utterances=False,
+                )
+                annotated_chunk_segments: list[Dict[str, Any]] = []
+                for segment in chunk_segments:
+                    annotated = speaker_resolver.annotate_segment(segment, chunk_index=chunk_index)
+                    annotated["speaker"] = speaker_resolver.label_for_emission(annotated).get("speaker")
+                    annotated_chunk_segments.append(annotated)
+                chunk_segments = annotated_chunk_segments
+
+                if not merged_segments:
+                    merged_segments = chunk_segments
+                else:
+                    overlap_start = chunk_start
+                    overlap_end = min(chunk_end, chunk_start + overlap_seconds)
+                    merged_segments = _merge_chunk_segments(merged_segments, chunk_segments, overlap_start, overlap_end)
+                resolved_emitter.process_chunk(
+                    chunk_segments,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    is_last=chunk_index == len(windows),
+                )
+                previous_chunk_text = chunk_text
+
+            resolved_emitter.finalize()
+            merged_segments = speaker_resolver.relabel_segments(merged_segments)
+            text = _segments_to_plain_text(merged_segments)
+            utterances = _segments_to_utterances(merged_segments, language)
+            return text, merged_segments, utterances
         finally:
-            if temp_path:
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    logging.warning("failed to delete temporary MLX input file: %s", temp_path)
+            speaker_resolver.close()
 
 
 def _segments_to_utterances(segments: list[Dict[str, Any]], languages: Optional[list[str]]) -> Optional[list[Any]]:
@@ -1317,7 +1940,13 @@ def _segments_to_utterances(segments: list[Dict[str, Any]], languages: Optional[
                 w_end = end_ts
             word_text = token if w_idx == 0 else f" {token}"
             words.append(mods.Word(start_ts=w_start, end_ts=w_end, word=word_text, probability=1.0, lang=lang))
-        utterances.append(mods.Utterance.from_words(utterance_id=str(idx), words=words, speaker=seg.get("speaker")))
+        utterances.append(
+            mods.Utterance.from_words(
+                utterance_id=str(idx),
+                words=words,
+                speaker=_public_segment_speaker(seg),
+            )
+        )
     return utterances
 
 
@@ -1418,7 +2047,7 @@ async def transcribe_handler(
             logging.info("returning jsonl payload (%s bytes)", len(formatted_jsonl))
             return formatted_jsonl, None
 
-        result = {"text": text, "segments": segments}
+        result = {"text": text, "segments": _public_segments(segments)}
         logging.info("transcription produced %s chars, %s segments (json output)", len(text), len(segments))
         logging.info("returning json payload (%s bytes)", len(json.dumps(result).encode("utf-8")))
         return json.dumps(result).encode("utf-8"), None
@@ -1614,6 +2243,58 @@ async def run(args: argparse.Namespace) -> int:
             os.environ.get("TRANSCRIPTION_OUTPUT_FORMAT"),
             "jsonl",
         ),
+        mlx_max_tokens=max(
+            1024,
+            _resolve_int(
+                _resolve(
+                    getattr(args, "mlx_max_tokens", None),
+                    _cfg_get_transcription(config_data, "mlx_max_tokens"),
+                    os.environ.get("MLX_MAX_TOKENS"),
+                    32768,
+                ),
+                32768,
+            )
+            or 32768,
+        ),
+        mlx_chunk_seconds=max(
+            0.0,
+            _resolve_float(
+                _resolve(
+                    getattr(args, "mlx_chunk_seconds", None),
+                    _cfg_get_transcription(config_data, "mlx_chunk_seconds"),
+                    os.environ.get("MLX_CHUNK_SECONDS"),
+                    20.0 * 60.0,
+                ),
+                20.0 * 60.0,
+            )
+            or 0.0,
+        ),
+        mlx_chunk_overlap_seconds=max(
+            0.0,
+            _resolve_float(
+                _resolve(
+                    getattr(args, "mlx_chunk_overlap_seconds", None),
+                    _cfg_get_transcription(config_data, "mlx_chunk_overlap_seconds"),
+                    os.environ.get("MLX_CHUNK_OVERLAP_SECONDS"),
+                    60.0,
+                ),
+                60.0,
+            )
+            or 0.0,
+        ),
+        mlx_context_characters=max(
+            0,
+            _resolve_int(
+                _resolve(
+                    getattr(args, "mlx_context_characters", None),
+                    _cfg_get_transcription(config_data, "mlx_context_characters"),
+                    os.environ.get("MLX_CONTEXT_CHARACTERS"),
+                    8000,
+                ),
+                8000,
+            )
+            or 0,
+        ),
     )
 
     # If config explicitly sets output formats (e.g., [txt]), honor that over env overrides.
@@ -1661,6 +2342,27 @@ async def run(args: argparse.Namespace) -> int:
             transcription_cfg.model,
             effective_concurrency,
         )
+        warmup_tasks: list[asyncio.Task[Any]] = []
+        if transcription_cfg.backend == "mlx-vibevoice":
+            async def _warm_mlx() -> None:
+                try:
+                    logging.info("warming MLX VibeVoice model")
+                    await asyncio.to_thread(mlx_service.warmup)
+                    logging.info("MLX VibeVoice warmup complete")
+                except Exception:
+                    logging.exception("MLX VibeVoice warmup failed; continuing without startup warmup")
+
+            warmup_tasks.append(asyncio.create_task(_warm_mlx()))
+
+            async def _warm_speaker_embeddings() -> None:
+                try:
+                    logging.info("warming speaker embedding model")
+                    await asyncio.to_thread(warmup_default_speaker_embedder, target_sample_rate=16000)
+                    logging.info("speaker embedding warmup complete")
+                except Exception:
+                    logging.exception("speaker embedding warmup failed; continuing without startup warmup")
+
+            warmup_tasks.append(asyncio.create_task(_warm_speaker_embeddings()))
 
         async def _handle_job(job: JobClaim, payload: bytes) -> Tuple[bytes, Optional[str]]:
             backend = _normalize_backend(job.get("metadata", {}).get("backend", worker_cfg.backend))
@@ -1696,6 +2398,9 @@ async def run(args: argparse.Namespace) -> int:
 
         await asyncio.gather(*(_worker_loop(slot) for slot in range(effective_concurrency)))
     finally:
+        for task in locals().get("warmup_tasks", []):
+            if not task.done():
+                task.cancel()
         if status_poster:
             await status_poster.stop()
         await worker.close()
@@ -1719,6 +2424,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beam-size", default=None, type=int)
     parser.add_argument("--best-of", default=None, type=int)
     parser.add_argument("--patience", default=None, type=float)
+    parser.add_argument("--mlx-max-tokens", type=int, default=None)
+    parser.add_argument("--mlx-chunk-seconds", type=float, default=None)
+    parser.add_argument("--mlx-chunk-overlap-seconds", type=float, default=None)
+    parser.add_argument("--mlx-context-characters", type=int, default=None)
     parser.add_argument("--diarization", action="store_true", default=None)
     parser.add_argument("--no-diarization", dest="diarization", action="store_false")
     parser.add_argument("--diarization-strategy", default=None)
