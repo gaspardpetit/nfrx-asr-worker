@@ -9,7 +9,14 @@ dependencies = [
   "faster-whisper>=1.1.1",
   "numpy>=1.26.0",
   "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+verbatim = [
   "verbatim[diarization]>=1.2.2",
+]
+mlx = [
+  "mlx-audio>=0.4.1 ; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
@@ -27,3 +34,9 @@ dev = []
 
 [tool.uv]
 package = true
+conflicts = [
+  [
+    { extra = "verbatim" },
+    { extra = "mlx" },
+  ],
+]

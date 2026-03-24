@@ -12,33 +12,82 @@ import platform
 import sys
 import tempfile
 import time
+import wave
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypedDict
 
 import httpx
 from dotenv import load_dotenv
-import torch
-from verbatim_audio.sources.factory import create_audio_sources
-from verbatim_audio.sources.sourceconfig import SourceConfig
-from verbatim.config import Config as VerbatimConfig
-from verbatim.models import Models as VerbatimModels
-from verbatim.verbatim import Verbatim
-from verbatim.transcript.words import Utterance, Word
-from verbatim_files.format.docx import DocxTranscriptWriter
-from verbatim_files.format.txt import COLORSCHEME_NONE, TextIOTranscriptWriter
-from verbatim_files.format.writer import (
-    LanguageStyle,
-    ProbabilityStyle,
-    SpeakerStyle,
-    TimestampStyle,
-    TranscriptWriterConfig,
-)
-from verbatim_cli import args as verbatim_args
-from verbatim_cli import configure as verbatim_configure
-from verbatim_cli.config_file import load_config_file, merge_args, select_profile
-from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline
-import torchaudio
+
+_VERBATIM_MODULES: Optional[SimpleNamespace] = None
+_VERBATIM_IMPORT_ERROR: Optional[Exception] = None
+
+
+def _load_verbatim_modules(required: bool = False) -> Optional[SimpleNamespace]:
+    global _VERBATIM_MODULES, _VERBATIM_IMPORT_ERROR
+    if _VERBATIM_MODULES is not None:
+        return _VERBATIM_MODULES
+    if _VERBATIM_IMPORT_ERROR is not None and not required:
+        return None
+    try:
+        from verbatim_audio.sources.factory import create_audio_sources
+        from verbatim_audio.sources.sourceconfig import SourceConfig
+        from verbatim.config import Config as VerbatimConfig
+        from verbatim.models import Models as VerbatimModels
+        from verbatim.verbatim import Verbatim
+        from verbatim.transcript.words import Utterance, Word
+        from verbatim_files.format.docx import DocxTranscriptWriter
+        from verbatim_files.format.txt import COLORSCHEME_NONE, TextIOTranscriptWriter
+        from verbatim_files.format.writer import (
+            LanguageStyle,
+            ProbabilityStyle,
+            SpeakerStyle,
+            TimestampStyle,
+            TranscriptWriterConfig,
+        )
+        from verbatim_cli import args as verbatim_args
+        from verbatim_cli import configure as verbatim_configure
+        from verbatim_cli.config_file import load_config_file, merge_args, select_profile
+    except Exception as exc:
+        _VERBATIM_IMPORT_ERROR = exc
+        if required:
+            raise RuntimeError(
+                "The selected configuration requires the optional 'verbatim' dependencies. "
+                "Install them with `uv sync --extra verbatim`."
+            ) from exc
+        return None
+    _VERBATIM_MODULES = SimpleNamespace(
+        create_audio_sources=create_audio_sources,
+        SourceConfig=SourceConfig,
+        VerbatimConfig=VerbatimConfig,
+        VerbatimModels=VerbatimModels,
+        Verbatim=Verbatim,
+        Utterance=Utterance,
+        Word=Word,
+        DocxTranscriptWriter=DocxTranscriptWriter,
+        COLORSCHEME_NONE=COLORSCHEME_NONE,
+        TextIOTranscriptWriter=TextIOTranscriptWriter,
+        LanguageStyle=LanguageStyle,
+        ProbabilityStyle=ProbabilityStyle,
+        SpeakerStyle=SpeakerStyle,
+        TimestampStyle=TimestampStyle,
+        TranscriptWriterConfig=TranscriptWriterConfig,
+        verbatim_args=verbatim_args,
+        verbatim_configure=verbatim_configure,
+        load_config_file=load_config_file,
+        merge_args=merge_args,
+        select_profile=select_profile,
+    )
+    return _VERBATIM_MODULES
+
+
+def _torch_cuda_available() -> bool:
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.cuda.is_available())
 
 
 class JobCanceled(Exception):
@@ -377,7 +426,18 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
     if not os.path.exists(path):
         logging.info("config file not found: %s (using defaults/env)", path)
         return {}
-    data = load_config_file(path)
+    mods = _load_verbatim_modules(required=False)
+    if mods is not None:
+        data = mods.load_config_file(path)
+    else:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise RuntimeError(
+                "Config parsing requires either the optional 'verbatim' dependencies or PyYAML."
+            ) from exc
+        with open(path, "r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
     if not isinstance(data, dict):
         raise ValueError(f"config must be a mapping: {path}")
     return data
@@ -475,6 +535,11 @@ def _output_format_from_formats(output_formats: list[str]) -> str:
 def _status_update_to_payload(update: Any, include_utterance: bool) -> Optional[StatusPayload]:
     if update is None:
         return None
+    if isinstance(update, dict):
+        payload = dict(update)
+        if not include_utterance:
+            payload.pop("utterance", None)
+        return payload if payload else None
     payload: StatusPayload = {}
     state = getattr(update, "state", None)
     if isinstance(state, str) and state.strip():
@@ -508,9 +573,11 @@ def _status_update_to_payload(update: Any, include_utterance: bool) -> Optional[
 
 def _apply_job_config(
     base_args: argparse.Namespace, job_cfg: Dict[str, Any]
-) -> Tuple[argparse.Namespace, Optional[list[str]], Optional[list[str]], Optional[TranscriptWriterConfig]]:
+) -> Tuple[argparse.Namespace, Optional[list[str]], Optional[list[str]], Optional[Any]]:
     if not job_cfg:
         return base_args, None, None, None
+
+    mods = _load_verbatim_modules(required=False)
 
     args = argparse.Namespace(**vars(base_args))
     languages = _normalize_languages(job_cfg.get("languages"))
@@ -537,31 +604,35 @@ def _apply_job_config(
                 setattr(args, key, True)
 
     fmt_cfg = output_cfg.get("format") if isinstance(output_cfg.get("format"), dict) else {}
-    ts_style = _coerce_enum(fmt_cfg.get("timestamp"), TimestampStyle)
-    if ts_style is not None:
-        args.format_timestamp = ts_style
-    sp_style = _coerce_enum(fmt_cfg.get("speaker"), SpeakerStyle)
-    if sp_style is not None:
-        args.format_speaker = sp_style
-    prob_style = _coerce_enum(fmt_cfg.get("probability"), ProbabilityStyle)
-    if prob_style is not None:
-        args.format_probability = prob_style
-    lang_style = _coerce_enum(fmt_cfg.get("language"), LanguageStyle)
-    if lang_style is not None:
-        args.format_language = lang_style
+    if mods is not None:
+        ts_style = _coerce_enum(fmt_cfg.get("timestamp"), mods.TimestampStyle)
+        if ts_style is not None:
+            args.format_timestamp = ts_style
+        sp_style = _coerce_enum(fmt_cfg.get("speaker"), mods.SpeakerStyle)
+        if sp_style is not None:
+            args.format_speaker = sp_style
+        prob_style = _coerce_enum(fmt_cfg.get("probability"), mods.ProbabilityStyle)
+        if prob_style is not None:
+            args.format_probability = prob_style
+        lang_style = _coerce_enum(fmt_cfg.get("language"), mods.LanguageStyle)
+        if lang_style is not None:
+            args.format_language = lang_style
 
-    write_config = verbatim_configure.make_write_config(args, logging.getLogger().level)
-    output_formats = (
-        verbatim_configure.build_output_formats(args, default_stdout=False)
-        if output_files is not None
-        else None
-    )
+        write_config = mods.verbatim_configure.make_write_config(args, logging.getLogger().level)
+        output_formats = (
+            mods.verbatim_configure.build_output_formats(args, default_stdout=False)
+            if output_files is not None
+            else None
+        )
+    else:
+        write_config = None
+        output_formats = output_files
     return args, output_files, output_formats, write_config
 
 
 def _resolve_device(device: str) -> str:
     if device == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        return "cuda" if _torch_cuda_available() else "cpu"
     return device
 
 
@@ -580,8 +651,14 @@ def _normalize_backend(value: Any) -> str:
 
 def _default_model_for_backend(backend: str) -> str:
     if backend == "mlx-vibevoice":
-        return "mlx-community/VibeVoice-ASR-4bit"
+        return "mlx-community/VibeVoice-ASR-8bit"
     return "large-v3"
+
+
+def _default_concurrency_for_backend(backend: str) -> int:
+    if backend == "mlx-vibevoice":
+        return 1
+    return 4
 
 
 def _resolve_bool(cli: Optional[bool], cfg: Any, env: Optional[str], default: bool) -> bool:
@@ -645,12 +722,25 @@ def _infer_suffix(filename: Optional[str], content_type: Optional[str]) -> str:
             return ".flac"
     return ".bin"
 
-def _format_text_output(utterances: list[Any], write_config: TranscriptWriterConfig) -> str:
-    writer = TextIOTranscriptWriter(
+def _format_text_output(utterances: list[Any], write_config: Optional[Any]) -> str:
+    mods = _load_verbatim_modules(required=False)
+    if mods is None or write_config is None:
+        segments: list[Dict[str, Any]] = []
+        for utt in utterances:
+            segments.append(
+                {
+                    "start": float(utt.get_start()) if hasattr(utt, "get_start") else 0.0,
+                    "end": float(utt.get_end()) if hasattr(utt, "get_end") else 0.0,
+                    "text": getattr(utt, "text", ""),
+                    "speaker": getattr(utt, "speaker", None),
+                }
+            )
+        return _format_text_from_segments(segments)
+    writer = mods.TextIOTranscriptWriter(
         config=write_config,
-        acknowledged_colours=COLORSCHEME_NONE,
-        unacknowledged_colours=COLORSCHEME_NONE,
-        unconfirmed_colors=COLORSCHEME_NONE,
+        acknowledged_colours=mods.COLORSCHEME_NONE,
+        unacknowledged_colours=mods.COLORSCHEME_NONE,
+        unconfirmed_colors=mods.COLORSCHEME_NONE,
     )
     chunks: list[bytes] = [writer.format_start()]
     for utt in utterances:
@@ -659,8 +749,11 @@ def _format_text_output(utterances: list[Any], write_config: TranscriptWriterCon
     return b"".join(chunks).decode("utf-8").strip()
 
 
-def _format_docx_output(utterances: list[Any], write_config: TranscriptWriterConfig) -> bytes:
-    writer = DocxTranscriptWriter(config=write_config)
+def _format_docx_output(utterances: list[Any], write_config: Optional[Any]) -> bytes:
+    mods = _load_verbatim_modules(required=True)
+    if write_config is None:
+        raise RuntimeError("docx output requires the optional 'verbatim' dependencies.")
+    writer = mods.DocxTranscriptWriter(config=write_config)
     for utt in utterances:
         writer.format_utterance(utt)
     return writer.flush()
@@ -703,14 +796,16 @@ class VerbatimService:
         self,
         config: TranscriptionConfig,
         diarization: DiarizationConfig,
-        source_config: SourceConfig,
-        write_config: TranscriptWriterConfig,
+        source_config: Any,
+        write_config: Optional[Any],
     ) -> None:
+        mods = _load_verbatim_modules(required=True)
         self._base_config = config
         self._diarization = diarization
         self._source_config = source_config
         self._write_config = write_config
-        self._models = VerbatimModels(
+        self._mods = mods
+        self._models = mods.VerbatimModels(
             device=config.device,
             whisper_model_size=config.model,
             stream=False,
@@ -719,8 +814,8 @@ class VerbatimService:
 
     def _build_config(
         self, language: Optional[list[str]], input_label: str
-    ) -> Tuple[VerbatimConfig, str, str]:
-        cfg = VerbatimConfig(
+    ) -> Tuple[Any, str, str]:
+        cfg = self._mods.VerbatimConfig(
             device=self._base_config.device,
             whisper_model_size=self._base_config.model,
             stream=False,
@@ -756,9 +851,9 @@ class VerbatimService:
         except OSError as exc:
             raise RuntimeError(f"Failed to read input file '{path}': {exc}") from exc
 
-        transcriber = Verbatim(cfg, models=self._models, status_hook=status_hook)
+        transcriber = self._mods.Verbatim(cfg, models=self._models, status_hook=status_hook)
         utterances: list[Any] = []
-        for audio_source in create_audio_sources(
+        for audio_source in self._mods.create_audio_sources(
             source_config=self._source_config,
             device=cfg.device,
             cache=cfg.cache,
@@ -794,16 +889,16 @@ class VerbatimService:
         payload: bytes,
         input_label: str,
         language: Optional[list[str]],
-        source_config: Optional[SourceConfig] = None,
+        source_config: Optional[Any] = None,
         status_hook: Optional[Callable[[Any], None]] = None,
     ) -> Tuple[str, list[Dict[str, Any]], list[Any]]:
         cfg, output_prefix, working_prefix = self._build_config(language, input_label)
         cfg.cache.set_bytes(input_label, payload)
         use_source_config = source_config or self._source_config
 
-        transcriber = Verbatim(cfg, models=self._models, status_hook=status_hook)
+        transcriber = self._mods.Verbatim(cfg, models=self._models, status_hook=status_hook)
         utterances: list[Any] = []
-        for audio_source in create_audio_sources(
+        for audio_source in self._mods.create_audio_sources(
             source_config=use_source_config,
             device=cfg.device,
             cache=cfg.cache,
@@ -839,9 +934,9 @@ class DiarizationService:
     def __init__(self, config: DiarizationConfig, device: str) -> None:
         self._config = config
         self._device = device
-        self._pipeline: Optional[Pipeline] = None
+        self._pipeline: Optional[Any] = None
 
-    def _get_pipeline(self) -> Optional[Pipeline]:
+    def _get_pipeline(self) -> Optional[Any]:
         if not self._config.enabled:
             return None
         if self._config.strategy != "pyannote":
@@ -851,6 +946,13 @@ class DiarizationService:
         if not token:
             raise ValueError("HUGGINGFACE_TOKEN is required for pyannote diarization.")
         if self._pipeline is None:
+            try:
+                from pyannote.audio import Pipeline
+                import torch
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Diarization requires the optional 'verbatim' dependencies. Install them with `uv sync --extra verbatim`."
+                ) from exc
             self._pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
             self._pipeline.to(torch.device(self._device))
         return self._pipeline
@@ -859,6 +961,12 @@ class DiarizationService:
         pipeline = self._get_pipeline()
         if pipeline is None:
             return []
+        try:
+            import torchaudio
+        except ImportError as exc:
+            raise RuntimeError(
+                "Diarization requires the optional 'verbatim' dependencies. Install them with `uv sync --extra verbatim`."
+            ) from exc
         waveform, sample_rate = torchaudio.load(path)
         if sample_rate != 16000:
             waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
@@ -876,6 +984,12 @@ class FastWhisperService:
     def __init__(self, config: TranscriptionConfig) -> None:
         logging.info("loading fast whisper model: %s (device=%s)", config.model, config.device)
         self._config = config
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "Fast whisper requires the base worker dependencies. Install them with `uv sync`."
+            ) from exc
         self._model = WhisperModel(config.model, device=config.device, compute_type="int8")
 
     def transcribe_file(
@@ -883,7 +997,7 @@ class FastWhisperService:
         path: str,
         language: Optional[list[str]],
         diarization_turns: list[Dict[str, Any]],
-    ) -> Tuple[str, list[Dict[str, Any]], list[Utterance]]:
+    ) -> Tuple[str, list[Dict[str, Any]], Optional[list[Any]]]:
         lang = None
         if language:
             # faster-whisper accepts a single language code; use first.
@@ -940,30 +1054,217 @@ class MlxVibeVoiceService:
         self._model = load_model(self._config.model)
         return self._model
 
+    @staticmethod
+    def _coerce_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _extract_stream_status(cls, chunk: Any, stream_finish: Optional[float] = None) -> Optional[StatusPayload]:
+        if chunk is None:
+            return None
+
+        text: Optional[str] = None
+        current: Optional[float] = None
+        finish: Optional[float] = None
+
+        if isinstance(chunk, str):
+            text = chunk.strip() or None
+        elif isinstance(chunk, dict):
+            text = str(chunk.get("text") or chunk.get("Content") or "").strip() or None
+            current = cls._coerce_float(
+                chunk.get("end_time")
+                or chunk.get("End")
+                or chunk.get("current_time")
+                or chunk.get("timestamp")
+                or chunk.get("time")
+            )
+            finish = cls._coerce_float(chunk.get("duration") or chunk.get("finish"))
+        else:
+            text = str(getattr(chunk, "text", "") or "").strip() or None
+            current = cls._coerce_float(
+                getattr(chunk, "end_time", None)
+                or getattr(chunk, "current_time", None)
+                or getattr(chunk, "timestamp", None)
+                or getattr(chunk, "time", None)
+            )
+            finish = cls._coerce_float(getattr(chunk, "duration", None) or getattr(chunk, "finish", None))
+
+        if finish is None:
+            finish = stream_finish
+
+        payload: StatusPayload = {"phase": "transcribing"}
+        if current is not None:
+            progress_payload: Dict[str, Any] = {
+                "current": round(current, 2),
+                "units": "seconds",
+            }
+            if finish is not None:
+                progress_payload["finish"] = round(finish, 2)
+                if finish > 0:
+                    progress_payload["percent"] = round(max(0.0, min(100.0, (current / finish) * 100.0)), 1)
+            payload["progress"] = progress_payload
+        if text:
+            payload["utterance"] = {"text": text}
+        return payload if "progress" in payload or "utterance" in payload else None
+
+    @staticmethod
+    def _normalize_segment(seg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(seg, dict):
+            return None
+        start = seg.get("start", seg.get("start_time", seg.get("Start", 0.0)))
+        end = seg.get("end", seg.get("end_time", seg.get("End", start)))
+        speaker = seg.get("speaker", seg.get("speaker_id", seg.get("Speaker")))
+        text = str(seg.get("text", seg.get("Content", ""))).strip()
+        normalized: Dict[str, Any] = {
+            "start": float(start),
+            "end": float(end),
+            "text": text,
+        }
+        if speaker is not None:
+            normalized["speaker"] = str(speaker)
+        return normalized
+
+    @classmethod
+    def _estimate_audio_duration(cls, path: str) -> Optional[float]:
+        try:
+            with wave.open(path, "rb") as wav_file:
+                frame_rate = wav_file.getframerate()
+                frame_count = wav_file.getnframes()
+                if frame_rate > 0:
+                    return frame_count / float(frame_rate)
+        except Exception:
+            pass
+
+        try:
+            import soundfile as sf
+        except ImportError:
+            return None
+
+        try:
+            info = sf.info(path)
+        except Exception:
+            return None
+        if getattr(info, "samplerate", 0) and getattr(info, "frames", 0):
+            return float(info.frames) / float(info.samplerate)
+        return None
+
+    @staticmethod
+    def _iter_json_objects(buffer: str) -> tuple[list[Dict[str, Any]], str]:
+        objects: list[Dict[str, Any]] = []
+        in_string = False
+        escape = False
+        depth = 0
+        start_idx: Optional[int] = None
+        consumed_upto = 0
+
+        for idx, char in enumerate(buffer):
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+                continue
+
+            if char == "{":
+                if depth == 0:
+                    start_idx = idx
+                depth += 1
+                continue
+
+            if char == "}":
+                if depth == 0:
+                    continue
+                depth -= 1
+                if depth == 0 and start_idx is not None:
+                    candidate = buffer[start_idx : idx + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(parsed, dict):
+                        objects.append(parsed)
+                        consumed_upto = idx + 1
+                    start_idx = None
+
+        remainder = buffer[consumed_upto:] if consumed_upto else buffer
+        return objects, remainder
+
+    def _stream_transcribe(
+        self,
+        model: Any,
+        path: str,
+        status_hook: Optional[Callable[[Any], None]],
+    ) -> list[Dict[str, Any]]:
+        segments: list[Dict[str, Any]] = []
+        stream_transcribe = getattr(model, "stream_transcribe", None)
+        if not callable(stream_transcribe):
+            return segments
+
+        try:
+            buffer = ""
+            estimated_finish = self._estimate_audio_duration(path)
+            for chunk in stream_transcribe(audio=path, max_tokens=4096):
+                if isinstance(chunk, str):
+                    buffer += chunk
+                    objects, buffer = self._iter_json_objects(buffer)
+                    if objects:
+                        for obj in objects:
+                            normalized = self._normalize_segment(obj)
+                            if normalized is not None:
+                                segments.append(normalized)
+                            payload = self._extract_stream_status(obj, estimated_finish)
+                            if payload and status_hook is not None:
+                                status_hook(payload)
+                    continue
+                payload = self._extract_stream_status(chunk, estimated_finish)
+                if payload and status_hook is not None:
+                    status_hook(payload)
+        except Exception:
+            logging.exception("MLX VibeVoice streaming status failed; continuing with final generate() result")
+            return []
+        return segments
+
     def transcribe_file(
         self,
         path: str,
         language: Optional[list[str]],
-    ) -> Tuple[str, list[Dict[str, Any]], list[Utterance]]:
+        status_hook: Optional[Callable[[Any], None]] = None,
+    ) -> Tuple[str, list[Dict[str, Any]], Optional[list[Any]]]:
         if language:
             logging.info("MLX VibeVoice ignores explicit language selection; using model auto-detection.")
-        result = self._get_model().generate(audio=path, max_tokens=8192, temperature=0.0)
-        raw_segments = getattr(result, "segments", None) or []
-        segments: list[Dict[str, Any]] = []
-        for seg in raw_segments:
-            start = seg.get("start_time", seg.get("Start", 0.0))
-            end = seg.get("end_time", seg.get("End", start))
-            speaker = seg.get("speaker_id", seg.get("Speaker"))
-            text = seg.get("text", seg.get("Content", ""))
-            normalized: Dict[str, Any] = {
-                "start": float(start),
-                "end": float(end),
-                "text": str(text).strip(),
-            }
-            if speaker is not None:
-                normalized["speaker"] = str(speaker)
-            segments.append(normalized)
-        text = (getattr(result, "text", None) or " ".join(seg["text"] for seg in segments)).strip()
+        model = self._get_model()
+        segments = self._stream_transcribe(model, path, status_hook)
+        if not segments:
+            result = model.generate(audio=path, max_tokens=8192, temperature=0.0)
+            raw_segments = getattr(result, "segments", None) or []
+            if not raw_segments:
+                raw_text = getattr(result, "text", None)
+                if isinstance(raw_text, str):
+                    try:
+                        parsed_text = json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        parsed_text = None
+                    if isinstance(parsed_text, list):
+                        raw_segments = [seg for seg in parsed_text if isinstance(seg, dict)]
+            segments = []
+            for seg in raw_segments:
+                normalized = self._normalize_segment(seg)
+                if normalized is not None:
+                    segments.append(normalized)
+            text = (getattr(result, "text", None) or " ".join(seg["text"] for seg in segments)).strip()
+        else:
+            text = " ".join(seg["text"] for seg in segments if seg.get("text")).strip()
         utterances = _segments_to_utterances(segments, language)
         return text, segments, utterances
 
@@ -972,14 +1273,15 @@ class MlxVibeVoiceService:
         payload: bytes,
         input_label: str,
         language: Optional[list[str]],
-    ) -> Tuple[str, list[Dict[str, Any]], list[Utterance]]:
+        status_hook: Optional[Callable[[Any], None]] = None,
+    ) -> Tuple[str, list[Dict[str, Any]], Optional[list[Any]]]:
         suffix = os.path.splitext(input_label)[1] or ".wav"
         temp_path = ""
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
                 handle.write(payload)
                 temp_path = handle.name
-            return self.transcribe_file(temp_path, language)
+            return self.transcribe_file(temp_path, language, status_hook)
         finally:
             if temp_path:
                 try:
@@ -988,9 +1290,12 @@ class MlxVibeVoiceService:
                     logging.warning("failed to delete temporary MLX input file: %s", temp_path)
 
 
-def _segments_to_utterances(segments: list[Dict[str, Any]], languages: Optional[list[str]]) -> list[Utterance]:
+def _segments_to_utterances(segments: list[Dict[str, Any]], languages: Optional[list[str]]) -> Optional[list[Any]]:
+    mods = _load_verbatim_modules(required=False)
+    if mods is None:
+        return None
     lang = languages[0] if languages else "en"
-    utterances: list[Utterance] = []
+    utterances: list[Any] = []
     for idx, seg in enumerate(segments):
         start_sec = float(seg.get("start", 0.0))
         end_sec = float(seg.get("end", start_sec))
@@ -1004,20 +1309,20 @@ def _segments_to_utterances(segments: list[Dict[str, Any]], languages: Optional[
             continue
         duration = max(1, end_ts - start_ts)
         step = max(1, duration // len(tokens))
-        words: list[Word] = []
+        words: list[Any] = []
         for w_idx, token in enumerate(tokens):
             w_start = start_ts + w_idx * step
             w_end = start_ts + (w_idx + 1) * step
             if w_idx == len(tokens) - 1:
                 w_end = end_ts
             word_text = token if w_idx == 0 else f" {token}"
-            words.append(Word(start_ts=w_start, end_ts=w_end, word=word_text, probability=1.0, lang=lang))
-        utterances.append(Utterance.from_words(utterance_id=str(idx), words=words, speaker=seg.get("speaker")))
+            words.append(mods.Word(start_ts=w_start, end_ts=w_end, word=word_text, probability=1.0, lang=lang))
+        utterances.append(mods.Utterance.from_words(utterance_id=str(idx), words=words, speaker=seg.get("speaker")))
     return utterances
 
 
 async def transcribe_handler(
-    verbatim_service: VerbatimService,
+    verbatim_service: Optional[VerbatimService],
     mlx_service: MlxVibeVoiceService,
     job: JobClaim,
     payload: bytes,
@@ -1061,11 +1366,12 @@ async def transcribe_handler(
         job_language = getattr(job_args, "languages", None) or language
 
         output_format = _output_format_from_formats(output_formats)
-        write_config = job_write_config or verbatim_service._write_config
-        source_config = verbatim_service._source_config
-        if job_cfg:
-            speakers_resolved = verbatim_configure.resolve_speakers(job_args)
-            source_config = verbatim_configure.make_source_config(job_args, speakers_resolved)
+        write_config = job_write_config or (verbatim_service._write_config if verbatim_service else None)
+        source_config = verbatim_service._source_config if verbatim_service else None
+        mods = _load_verbatim_modules(required=False)
+        if job_cfg and mods is not None and verbatim_service is not None:
+            speakers_resolved = mods.verbatim_configure.resolve_speakers(job_args)
+            source_config = mods.verbatim_configure.make_source_config(job_args, speakers_resolved)
 
         suffix = _infer_suffix(filename, content_type)
         base = os.path.splitext(os.path.basename(filename or "payload"))[0] or "payload"
@@ -1078,8 +1384,11 @@ async def transcribe_handler(
                 payload,
                 input_label,
                 job_language,
+                status_hook,
             )
         else:
+            if verbatim_service is None:
+                return b"", "verbatim backend selected but optional verbatim dependencies are not installed"
             text, segments, utterances = await asyncio.to_thread(
                 verbatim_service.transcribe_bytes,
                 payload,
@@ -1125,19 +1434,33 @@ async def run(args: argparse.Namespace) -> int:
     config_data = _load_config(args.config)
     logging.info("Loaded config file: %s", args.config)
 
-    verbatim_parser = verbatim_args.build_parser(include_input=False)
-    verbatim_defaults = verbatim_parser.parse_args([])
-    profile_overrides = select_profile(config_data, filename=None) if config_data else {}
-    verbatim_user = argparse.Namespace(**vars(verbatim_defaults))
-    if args.language:
-        verbatim_user.languages = [args.language]
-    if args.beam_size is not None:
-        verbatim_user.nb_beams = args.beam_size
-    if args.diarization_strategy:
-        verbatim_user.diarize = args.diarization_strategy
-    if args.diarization_speakers is not None:
-        verbatim_user.speakers = args.diarization_speakers
-    verbatim_cfg_args = merge_args(verbatim_defaults, profile_overrides, verbatim_user)
+    requested_backend = _normalize_backend(
+        _resolve(args.backend, _cfg_get(config_data, "worker", "backend"), os.environ.get("ASR_BACKEND"), "auto")
+    )
+    verbatim_mods = _load_verbatim_modules(required=False)
+
+    if verbatim_mods is not None:
+        verbatim_parser = verbatim_mods.verbatim_args.build_parser(include_input=False)
+        verbatim_defaults = verbatim_parser.parse_args([])
+        profile_overrides = verbatim_mods.select_profile(config_data, filename=None) if config_data else {}
+        verbatim_user = argparse.Namespace(**vars(verbatim_defaults))
+        if args.language:
+            verbatim_user.languages = [args.language]
+        if args.beam_size is not None:
+            verbatim_user.nb_beams = args.beam_size
+        if args.diarization_strategy:
+            verbatim_user.diarize = args.diarization_strategy
+        if args.diarization_speakers is not None:
+            verbatim_user.speakers = args.diarization_speakers
+        verbatim_cfg_args = verbatim_mods.merge_args(verbatim_defaults, profile_overrides, verbatim_user)
+    else:
+        verbatim_cfg_args = argparse.Namespace(
+            languages=[args.language] if args.language else None,
+            nb_beams=args.beam_size,
+            diarize=args.diarization_strategy,
+            speakers=args.diarization_speakers,
+            cpu=False,
+        )
 
     worker_cfg = WorkerConfig(
         base_url=_resolve(args.base_url, _cfg_get(config_data, "worker", "base_url"), os.environ.get("NFRX_BASE_URL"), DEFAULT_BASE_URL),
@@ -1149,16 +1472,19 @@ async def run(args: argparse.Namespace) -> int:
         concurrency=max(
             1,
             _resolve_int(
-                _resolve(args.concurrency, _cfg_get(config_data, "worker", "concurrency"), os.environ.get("NFRX_CONCURRENCY"), 4),
-                4,
+                _resolve(
+                    args.concurrency,
+                    _cfg_get(config_data, "worker", "concurrency"),
+                    os.environ.get("NFRX_CONCURRENCY"),
+                    _default_concurrency_for_backend(requested_backend),
+                ),
+                _default_concurrency_for_backend(requested_backend),
             )
-            or 4,
+            or _default_concurrency_for_backend(requested_backend),
         ),
         once=_resolve_bool(args.once, _cfg_get(config_data, "worker", "once"), os.environ.get("NFRX_ONCE"), False),
         log_level=_resolve(args.log_level, _cfg_get(config_data, "worker", "log_level"), os.environ.get("LOG_LEVEL"), "INFO"),
-        backend=_normalize_backend(
-            _resolve(args.backend, _cfg_get(config_data, "worker", "backend"), os.environ.get("ASR_BACKEND"), "auto")
-        ),
+        backend=requested_backend,
         strategy=_resolve(args.strategy, _cfg_get(config_data, "worker", "strategy"), os.environ.get("ASR_STRATEGY"), "verbatim"),
         status_progress=_resolve_bool(
             args.status_progress,
@@ -1207,7 +1533,11 @@ async def run(args: argparse.Namespace) -> int:
         client_key=_resolve(args.client_key, _cfg_get(config_data, "auth", "client_key"), os.environ.get("NFRX_CLIENT_KEY"), None)
     )
 
-    speakers_resolved = verbatim_configure.resolve_speakers(verbatim_cfg_args)
+    speakers_resolved = (
+        verbatim_mods.verbatim_configure.resolve_speakers(verbatim_cfg_args)
+        if verbatim_mods is not None
+        else getattr(verbatim_cfg_args, "speakers", None)
+    )
     diarization_cfg = DiarizationConfig(
         enabled=_resolve_bool(args.diarization, _cfg_get(config_data, "diarization", "enabled"), os.environ.get("DIARIZATION_ENABLED"), True),
         strategy=_resolve(
@@ -1232,10 +1562,17 @@ async def run(args: argparse.Namespace) -> int:
         ),
     )
 
-    output_formats = verbatim_configure.build_output_formats(verbatim_cfg_args)
-    output_format = "json"
-    if "txt" in output_formats or "stdout" in output_formats or "stdout-nocolor" in output_formats:
-        output_format = "text"
+    if verbatim_mods is not None:
+        output_formats = verbatim_mods.verbatim_configure.build_output_formats(verbatim_cfg_args)
+    else:
+        configured_output = _cfg_get_transcription(config_data, "output_format") or _cfg_get_transcription(config_data, "output")
+        if str(configured_output or "").strip().lower() == "text":
+            output_formats = ["txt"]
+        elif str(configured_output or "").strip().lower() == "json":
+            output_formats = ["json"]
+        else:
+            output_formats = ["jsonl"]
+    output_format = _output_format_from_formats(output_formats)
     logging.info("Output formats: %s (selected output_format=%s)", output_formats, output_format)
 
     resolved_device = _resolve(
@@ -1244,9 +1581,7 @@ async def run(args: argparse.Namespace) -> int:
         os.environ.get("WHISPER_DEVICE"),
         "cpu" if getattr(verbatim_cfg_args, "cpu", False) else "auto",
     )
-    resolved_backend = _normalize_backend(
-        _resolve(args.backend, _cfg_get(config_data, "worker", "backend"), os.environ.get("ASR_BACKEND"), "auto")
-    )
+    resolved_backend = requested_backend
     transcription_cfg = TranscriptionConfig(
         backend=resolved_backend,
         model=_resolve(
@@ -1277,7 +1612,7 @@ async def run(args: argparse.Namespace) -> int:
             None,
             _cfg_get_transcription(config_data, "output_format") or _cfg_get_transcription(config_data, "output"),
             os.environ.get("TRANSCRIPTION_OUTPUT_FORMAT"),
-            output_format,
+            "jsonl",
         ),
     )
 
@@ -1285,8 +1620,16 @@ async def run(args: argparse.Namespace) -> int:
     if output_formats and "json" not in output_formats:
         transcription_cfg.output_format = "text"
 
-    write_config = verbatim_configure.make_write_config(verbatim_cfg_args, logging.getLogger().level)
-    source_config = verbatim_configure.make_source_config(verbatim_cfg_args, speakers_resolved)
+    write_config = (
+        verbatim_mods.verbatim_configure.make_write_config(verbatim_cfg_args, logging.getLogger().level)
+        if verbatim_mods is not None
+        else None
+    )
+    source_config = (
+        verbatim_mods.verbatim_configure.make_source_config(verbatim_cfg_args, speakers_resolved)
+        if verbatim_mods is not None
+        else None
+    )
 
     worker = NfrxJobsWorker(worker_cfg.base_url, auth)
     status_poster: Optional[NfrxStatusPoster] = None
@@ -1297,9 +1640,18 @@ async def run(args: argparse.Namespace) -> int:
             min_progress_seconds=worker_cfg.status_min_progress_seconds,
         )
         status_poster.start(asyncio.get_running_loop())
-    verbatim_service = VerbatimService(transcription_cfg, diarization_cfg, source_config, write_config)
+    verbatim_service = (
+        VerbatimService(transcription_cfg, diarization_cfg, source_config, write_config)
+        if verbatim_mods is not None
+        else None
+    )
     mlx_service = MlxVibeVoiceService(transcription_cfg)
     diarization_service = DiarizationService(diarization_cfg, transcription_cfg.device)
+    if worker_cfg.backend == "verbatim" and verbatim_service is None:
+        raise RuntimeError(
+            "The 'verbatim' backend is selected but optional verbatim dependencies are not installed. "
+            "Install them with `uv sync --extra verbatim`."
+        )
     try:
         types = worker_cfg.types.split(",") if worker_cfg.types else None
         effective_concurrency = 1 if worker_cfg.once else worker_cfg.concurrency

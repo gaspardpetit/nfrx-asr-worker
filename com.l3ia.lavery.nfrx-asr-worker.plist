@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.l3ia.lavery.nfrx-asr-worker</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Volumes/Data/code/github/nfrx-asr-worker</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>HOME</key>
+      <string>/Users/gpetit</string>
+      <key>PATH</key>
+      <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/bin/make</string>
+      <string>run</string>
+    </array>
+
+    <key>UserName</key>
+    <string>gpetit</string>
+    <key>GroupName</key>
+    <string>staff</string>
+
+    <key>StandardOutPath</key>
+    <string>/Volumes/Data/logs/nfrx-asr-worker/launchd.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Volumes/Data/logs/nfrx-asr-worker/launchd.stderr.log</string>
+
+    <key>KeepAlive</key>
+    <dict>
+      <key>SuccessfulExit</key>
+      <false/>
+    </dict>
+
+    <key>PathState</key>
+    <dict>
+      <key>/Volumes/Data</key>
+      <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+  </dict>
+</plist>
