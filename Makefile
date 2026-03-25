@@ -11,7 +11,7 @@ install-mlx:
 
 install-verbatim:
 	uv pip install --python $(PYTHON) -e .
-	uv pip install --python $(PYTHON) "verbatim[diarization,qwen,mms_lid] @ git+https://github.com/gaspardpetit/verbatim.git@feat/non-speech-markers"
+	uv pip install --python $(PYTHON) "verbatim[diarization,qwen,mms_lid] @ git+https://github.com/gaspardpetit/verbatim.git@main"
 	uv pip install --python $(PYTHON) "git+https://github.com/gaspardpetit/senko.git@feature/in-memory-diarization"
 
 install-cpu: install
