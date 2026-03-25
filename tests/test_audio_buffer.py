@@ -1,8 +1,16 @@
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
-from transcribe.audio import AudioBuffer, AudioDecodeError, audio_buffer_from_any, normalize_audio_buffer, slice_audio_buffer
+from transcribe.audio import (
+    AudioBuffer,
+    AudioDecodeError,
+    _mono_from_pyav_frame_array,
+    audio_buffer_from_any,
+    normalize_audio_buffer,
+    slice_audio_buffer,
+)
 
 
 class AudioBufferTests(unittest.TestCase):
@@ -32,6 +40,37 @@ class AudioBufferTests(unittest.TestCase):
     def test_normalize_audio_buffer_rejects_empty_payload(self) -> None:
         with self.assertRaises(AudioDecodeError):
             normalize_audio_buffer(b"", target_sample_rate=24000)
+
+    def test_mono_from_pyav_frame_array_handles_planar_stereo(self) -> None:
+        frame = np.array(
+            [
+                [1.0, 3.0, 5.0],
+                [3.0, 5.0, 7.0],
+            ],
+            dtype=np.float32,
+        )
+        sample_format = SimpleNamespace(is_planar=True)
+        mono = _mono_from_pyav_frame_array(frame, channels=2, sample_format=sample_format)
+        np.testing.assert_array_equal(mono, np.array([2.0, 4.0, 6.0], dtype=np.float32))
+
+    def test_mono_from_pyav_frame_array_handles_packed_stereo(self) -> None:
+        frame = np.array(
+            [
+                [1.0, 3.0],
+                [3.0, 5.0],
+                [5.0, 7.0],
+            ],
+            dtype=np.float32,
+        )
+        sample_format = SimpleNamespace(is_planar=False)
+        mono = _mono_from_pyav_frame_array(frame, channels=2, sample_format=sample_format)
+        np.testing.assert_array_equal(mono, np.array([2.0, 4.0, 6.0], dtype=np.float32))
+
+    def test_mono_from_pyav_frame_array_handles_single_plane_packed_stereo(self) -> None:
+        frame = np.array([[1.0, 3.0, 3.0, 5.0, 5.0, 7.0]], dtype=np.float32)
+        sample_format = SimpleNamespace(is_planar=False)
+        mono = _mono_from_pyav_frame_array(frame, channels=2, sample_format=sample_format)
+        np.testing.assert_array_equal(mono, np.array([2.0, 4.0, 6.0], dtype=np.float32))
 
 
 if __name__ == "__main__":
