@@ -229,6 +229,31 @@ class ChunkAlignmentTests(unittest.TestCase):
         self.assertEqual(emitted, ["3"])
         self.assertEqual(observed, ["SPEAKER_03"])
 
+    def test_chunk_resolved_emitter_first_chunk_does_not_double_emit_non_overlap_body(self) -> None:
+        emitted = []
+
+        def hook(payload):
+            emitted.append(payload["utterance"]["text"])
+
+        emitter = ChunkResolvedEmitter(overlap_seconds=60.0, finish=1515.0, status_hook=hook)
+        chunk_one = [
+            {"start": 0.0, "end": 20.0, "text": "Opening section.", "speaker": "0"},
+            {"start": 62.03, "end": 80.0, "text": "Body one.", "speaker": "0"},
+            {"start": 200.0, "end": 240.0, "text": "Body two.", "speaker": "1"},
+            {"start": 1128.78, "end": 1200.0, "text": "Tail overlap.", "speaker": "0"},
+        ]
+
+        emitter.process_chunk(chunk_one, chunk_start=0.0, chunk_end=1200.0, is_last=False)
+
+        self.assertEqual(
+            emitted,
+            [
+                "Opening section.",
+                "Body one.",
+                "Body two.",
+            ],
+        )
+
     def test_chunk_resolved_emitter_last_chunk_does_not_double_emit_after_transform(self) -> None:
         emitted = []
 

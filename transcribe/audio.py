@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +40,62 @@ def _validate_audio_array(audio_array: np.ndarray, *, source: str) -> np.ndarray
     return np.ascontiguousarray(mono, dtype=np.float32)
 
 
+def _mono_from_pyav_frame_array(
+    frame_array: np.ndarray,
+    *,
+    channels: int | None,
+    sample_format: Any,
+) -> np.ndarray:
+    if frame_array.ndim == 1:
+        return np.ascontiguousarray(frame_array, dtype=np.float32)
+    if frame_array.ndim != 2:
+        raise AudioDecodeError(f"Unexpected decoded frame shape from PyAV: {frame_array.shape}")
+
+    channel_count = int(channels or 0)
+    if channel_count <= 0:
+        if frame_array.shape[0] == 1:
+            return np.ascontiguousarray(frame_array[0], dtype=np.float32)
+        if frame_array.shape[1] == 1:
+            return np.ascontiguousarray(frame_array[:, 0], dtype=np.float32)
+        raise AudioDecodeError(f"PyAV reported invalid channel count for frame shape {frame_array.shape}")
+
+    def _mono_from_packed_interleaved(buffer: np.ndarray) -> np.ndarray:
+        flat = np.ascontiguousarray(buffer.reshape(-1), dtype=np.float32)
+        if flat.size % channel_count != 0:
+            raise AudioDecodeError(
+                f"Packed PyAV frame length {flat.size} is not divisible by channel count {channel_count}"
+            )
+        return np.ascontiguousarray(flat.reshape(-1, channel_count).mean(axis=1), dtype=np.float32)
+
+    is_planar = getattr(sample_format, "is_planar", None)
+    if is_planar is True:
+        if frame_array.shape[0] != channel_count:
+            raise AudioDecodeError(
+                f"Planar PyAV frame shape {frame_array.shape} does not match channel count {channel_count}"
+            )
+        return np.ascontiguousarray(frame_array.mean(axis=0), dtype=np.float32)
+    if is_planar is False:
+        if frame_array.shape[0] == 1:
+            return _mono_from_packed_interleaved(frame_array)
+        if frame_array.shape[1] != channel_count:
+            raise AudioDecodeError(
+                f"Packed PyAV frame shape {frame_array.shape} does not match channel count {channel_count}"
+            )
+        return np.ascontiguousarray(frame_array.mean(axis=1), dtype=np.float32)
+
+    if frame_array.shape[0] == channel_count:
+        return np.ascontiguousarray(frame_array.mean(axis=0), dtype=np.float32)
+    if frame_array.shape[1] == channel_count:
+        return np.ascontiguousarray(frame_array.mean(axis=1), dtype=np.float32)
+    if frame_array.shape[0] == 1:
+        return _mono_from_packed_interleaved(frame_array)
+    if channel_count == 1:
+        return np.ascontiguousarray(frame_array.reshape(-1), dtype=np.float32)
+    raise AudioDecodeError(
+        f"Cannot infer PyAV channel layout for frame shape {frame_array.shape} and channel count {channel_count}"
+    )
+
+
 def _decode_audio_bytes_pyav(payload: bytes, *, sample_rate: int) -> np.ndarray:
     import av
     from scipy.signal import resample_poly
@@ -55,24 +112,48 @@ def _decode_audio_bytes_pyav(payload: bytes, *, sample_rate: int) -> np.ndarray:
         if not audio_streams:
             raise AudioDecodeError("PyAV found no audio stream in payload")
         stream = audio_streams[0]
-        source_rate = int(stream.codec_context.sample_rate or 0)
+        codec_context = stream.codec_context
+        source_rate = int(codec_context.sample_rate or 0)
         if source_rate <= 0:
             raise AudioDecodeError(f"PyAV reported invalid sample rate: {source_rate!r}")
+        channel_layout = getattr(codec_context, "layout", None)
+        layout_name = getattr(channel_layout, "name", None)
+        channels = getattr(codec_context, "channels", None)
+        sample_format = getattr(codec_context, "format", None)
+        sample_format_name = getattr(sample_format, "name", None)
+        bits_per_sample = getattr(codec_context, "bits_per_coded_sample", None) or getattr(
+            codec_context, "bits_per_raw_sample", None
+        )
+        stream_duration = None
+        if stream.duration is not None and stream.time_base is not None:
+            try:
+                stream_duration = float(stream.duration * stream.time_base)
+            except Exception:
+                stream_duration = None
+        logging.info(
+            "received audio payload bytes=%s container=%s codec=%s sample_rate=%s channels=%s layout=%s "
+            "sample_format=%s bits_per_sample=%s stream_duration=%.3fs target_sample_rate=%s",
+            len(payload),
+            getattr(container, "format", None).name if getattr(container, "format", None) is not None else None,
+            getattr(codec_context, "name", None),
+            source_rate,
+            channels,
+            layout_name,
+            sample_format_name,
+            bits_per_sample,
+            stream_duration if stream_duration is not None else -1.0,
+            sample_rate,
+        )
 
         collected: list[np.ndarray] = []
         for frame in container.decode(stream):
             arr = frame.to_ndarray()
             frame_array = np.asarray(arr, dtype=np.float32)
-            if frame_array.ndim == 1:
-                frame_array = frame_array[np.newaxis, :]
-            elif frame_array.ndim != 2:
-                raise AudioDecodeError(f"Unexpected decoded frame shape from PyAV: {frame_array.shape}")
-            if frame_array.size == 0 or frame_array.shape[1] == 0:
+            if frame_array.size == 0:
                 continue
-            if frame_array.shape[0] > 1:
-                frame_array = frame_array.mean(axis=0, keepdims=True)
-
-            mono_frame = np.squeeze(frame_array, axis=0)
+            mono_frame = _mono_from_pyav_frame_array(frame_array, channels=channels, sample_format=sample_format)
+            if mono_frame.size == 0:
+                continue
             if source_rate != sample_rate:
                 mono_frame = resample_poly(mono_frame, sample_rate, source_rate).astype(np.float32, copy=False)
             collected.append(np.asarray(mono_frame, dtype=np.float32))
@@ -81,7 +162,15 @@ def _decode_audio_bytes_pyav(payload: bytes, *, sample_rate: int) -> np.ndarray:
             raise AudioDecodeError("PyAV decode produced no audio frames")
 
         audio = np.concatenate(collected, axis=0)
-        return _validate_audio_array(audio, source="PyAV decode")
+        normalized = _validate_audio_array(audio, source="PyAV decode")
+        logging.info(
+            "normalized audio buffer target_sample_rate=%s samples=%s duration=%.3fs dtype=%s channels=1",
+            sample_rate,
+            normalized.size,
+            float(normalized.shape[-1]) / float(sample_rate),
+            normalized.dtype,
+        )
+        return normalized
     except AudioDecodeError:
         raise
     except Exception as exc:

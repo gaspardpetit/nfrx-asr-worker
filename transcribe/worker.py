@@ -13,6 +13,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from functools import partial
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypedDict
 
@@ -92,6 +93,17 @@ def _torch_cuda_available() -> bool:
     return bool(torch.cuda.is_available())
 
 
+def _torch_mps_available() -> bool:
+    try:
+        import torch
+    except ImportError:
+        return False
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is None:
+        return False
+    return bool(mps_backend.is_available())
+
+
 class JobCanceled(Exception):
     pass
 
@@ -112,6 +124,7 @@ StatusHandler = Callable[[str, Optional[Dict[str, Any]]], Awaitable[None]]
 StatusPayload = Dict[str, Any]
 
 DEFAULT_BASE_URL = "https://nfrx.l3ia.ca/"
+DEFAULT_LANGUAGES = ["en", "fr"]
 
 
 @dataclass
@@ -129,11 +142,16 @@ class TranscriptionConfig:
     device: str = "auto"
     compute_type: str = "int8"
     language: Optional[list[str]] = None
+    transcriber_backend: str = "auto"
+    language_identifier_backend: str = "transcriber"
+    mms_lid_model_size: str = "facebook/mms-lid-126"
     beam_size: Optional[int] = None
     best_of: Optional[int] = None
     patience: Optional[float] = None
     output_format: str = "json"  # json|text
     mlx_max_tokens: int = 32768
+    mlx_repetition_penalty: float = 1.08
+    mlx_repetition_context_size: int = 256
     mlx_chunk_seconds: float = 20.0 * 60.0
     mlx_chunk_overlap_seconds: float = 60.0
     mlx_context_characters: int = 8000
@@ -201,10 +219,10 @@ class NfrxStatusPoster:
         if watchdog is not None:
             watchdog.cancel()
 
-    def enqueue(self, job_id: str, payload: StatusPayload) -> None:
+    def enqueue(self, job_id: str, payload: StatusPayload, *, origin: str = "unknown") -> None:
         if self._closed or job_id in self._completed_jobs:
             return
-        self._queue.put_nowait({"job_id": job_id, "payload": payload})
+        self._queue.put_nowait({"job_id": job_id, "payload": payload, "origin": origin})
 
     def start_watchdog(self, job_id: str, interval_seconds: float, payload: StatusPayload) -> None:
         if interval_seconds <= 0 or self._closed or job_id in self._completed_jobs:
@@ -221,7 +239,18 @@ class NfrxStatusPoster:
                     await asyncio.sleep(interval_seconds)
                     if self._closed or job_id in self._completed_jobs:
                         return
-                    self.enqueue(job_id, payload)
+                    last_current = self._last_progress.get(job_id)
+                    last_time = self._last_progress_time.get(job_id)
+                    age = None if last_time is None else max(0.0, time.monotonic() - last_time)
+                    logging.debug(
+                        "status watchdog firing job=%s interval=%.1fs last_progress=%s last_progress_age=%s payload_keys=%s",
+                        job_id,
+                        interval_seconds,
+                        "n/a" if last_current is None else f"{last_current:.2f}",
+                        "n/a" if age is None else f"{age:.2f}s",
+                        sorted(payload.keys()),
+                    )
+                    self.enqueue(job_id, payload, origin="watchdog")
             except asyncio.CancelledError:
                 return
 
@@ -240,7 +269,7 @@ class NfrxStatusPoster:
             payload = _status_update_to_payload(update, include_utterance)
             if payload is None:
                 return
-            loop.call_soon_threadsafe(self.enqueue, job_id, payload)
+            loop.call_soon_threadsafe(partial(self.enqueue, job_id, payload, origin="model"))
 
         return hook
 
@@ -251,6 +280,7 @@ class NfrxStatusPoster:
                 return
             job_id = item.get("job_id")
             payload = item.get("payload") or {}
+            origin = str(item.get("origin") or "unknown")
             if not job_id or job_id in self._completed_jobs:
                 continue
             progress = payload.get("progress")
@@ -268,9 +298,31 @@ class NfrxStatusPoster:
                         and (current - last_current) < self._min_progress_seconds
                         and (now - last_time) < self._min_interval_seconds
                     ):
+                        logging.debug(
+                            "status poster suppressed update job=%s origin=%s current=%.2f last=%.2f age=%.2fs min_progress=%.2f min_interval=%.2f",
+                            job_id,
+                            origin,
+                            current,
+                            last_current,
+                            now - last_time,
+                            self._min_progress_seconds,
+                            self._min_interval_seconds,
+                        )
                         continue
                     self._last_progress[job_id] = current
                     self._last_progress_time[job_id] = now
+            progress_summary = None
+            if isinstance(progress, dict) and "current" in progress:
+                finish = progress.get("finish")
+                progress_summary = f"{progress.get('current')}/{finish}" if finish is not None else str(progress.get("current"))
+            logging.debug(
+                "status poster sending job=%s origin=%s progress=%s has_utterance=%s payload_keys=%s",
+                job_id,
+                origin,
+                progress_summary or "none",
+                "utterance" in payload,
+                sorted(payload.keys()),
+            )
             try:
                 await self._worker.update_status(job_id, "running", payload=payload)
             except JobCanceled:
@@ -638,12 +690,14 @@ def _apply_job_config(
 
 def _resolve_device(device: str) -> str:
     if device == "auto":
+        if platform.system() == "Darwin" and _torch_mps_available():
+            return "mps"
         return "cuda" if _torch_cuda_available() else "cpu"
     return device
 
 
 def _default_backend() -> str:
-    return "mlx-vibevoice" if platform.system() == "Darwin" else "verbatim"
+    return "verbatim"
 
 
 def _normalize_backend(value: Any) -> str:
@@ -836,6 +890,15 @@ def _segments_to_plain_text(segments: list[Dict[str, Any]]) -> str:
     return " ".join((seg.get("text") or "").strip() for seg in segments if (seg.get("text") or "").strip()).strip()
 
 
+def _debug_text_preview(value: str, limit: int = 240) -> str:
+    if not value:
+        return ""
+    normalized = value.replace("\n", "\\n").replace("\r", "\\r")
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[:limit]}..."
+
+
 def _normalize_alignment_text(text: str) -> str:
     text = (text or "").lower()
     text = re.sub(r"\s+", " ", text)
@@ -981,6 +1044,24 @@ def _edge_confidence(segment: Dict[str, Any], overlap_start: float, overlap_end:
     return max(0.0, midpoint - overlap_start)
 
 
+def _debug_segment_summary(segment: Dict[str, Any]) -> str:
+    speaker = segment.get("speaker")
+    start = float(segment.get("start", 0.0))
+    end = float(segment.get("end", start))
+    text = " ".join(str(segment.get("text") or "").strip().split())
+    if len(text) > 96:
+        text = text[:93] + "..."
+    return f"{start:.2f}-{end:.2f} speaker={speaker!r} text={text!r}"
+
+
+def _debug_segments_summary(name: str, segments: list[Dict[str, Any]]) -> str:
+    if not segments:
+        return f"{name}=<empty>"
+    previews = ", ".join(_debug_segment_summary(seg) for seg in segments[:5])
+    suffix = "" if len(segments) <= 5 else f", ... (+{len(segments) - 5} more)"
+    return f"{name}[{len(segments)}]=[{previews}{suffix}]"
+
+
 def _merge_chunk_segments(
     previous_segments: list[Dict[str, Any]],
     current_segments: list[Dict[str, Any]],
@@ -998,6 +1079,14 @@ def _merge_chunk_segments(
     previous_overlap = [previous_segments[idx] for idx in previous_overlap_indices]
     current_overlap = [current_segments[idx] for idx in current_overlap_indices]
     matches = _align_overlap_segments(previous_overlap, current_overlap)
+    logging.debug(
+        "merge_chunk_segments start=%.2fs end=%.2fs %s %s matches=%s",
+        overlap_start,
+        overlap_end,
+        _debug_segments_summary("previous_overlap", previous_overlap),
+        _debug_segments_summary("current_overlap", current_overlap),
+        len(matches),
+    )
 
     drop_previous: set[int] = set()
     drop_current: set[int] = set()
@@ -1011,14 +1100,28 @@ def _merge_chunk_segments(
         curr_conf = _edge_confidence(curr_seg, overlap_start, overlap_end, prefer_previous=False)
         prev_text = str(prev_seg.get("text") or "")
         curr_text = str(curr_seg.get("text") or "")
+        decision = "keep-previous"
         if _is_more_complete_text(curr_text, prev_text) and score >= 0.55:
             drop_previous.add(prev_idx)
+            decision = "prefer-current-more-complete"
         elif _is_more_complete_text(prev_text, curr_text) and score >= 0.55:
             drop_current.add(curr_idx)
+            decision = "prefer-previous-more-complete"
         elif curr_conf > prev_conf and score >= 0.55:
             drop_previous.add(prev_idx)
+            decision = "prefer-current-edge-confidence"
         else:
             drop_current.add(curr_idx)
+            decision = "prefer-previous-edge-confidence"
+        logging.debug(
+            "merge_chunk_segments match score=%.4f decision=%s prev_conf=%.4f curr_conf=%.4f previous=(%s) current=(%s)",
+            score,
+            decision,
+            prev_conf,
+            curr_conf,
+            _debug_segment_summary(prev_seg),
+            _debug_segment_summary(curr_seg),
+        )
 
     for curr_idx in current_overlap_indices:
         if curr_idx in drop_current:
@@ -1031,11 +1134,23 @@ def _merge_chunk_segments(
             score = _segment_alignment_score(prev_seg, curr_seg)
             if score >= 0.82:
                 drop_current.add(curr_idx)
+                logging.debug(
+                    "merge_chunk_segments dropping current as duplicate score=%.4f current=(%s) previous=(%s)",
+                    score,
+                    _debug_segment_summary(curr_seg),
+                    _debug_segment_summary(prev_seg),
+                )
                 break
 
     merged = [seg for idx, seg in enumerate(previous_segments) if idx not in drop_previous]
     merged.extend(seg for idx, seg in enumerate(current_segments) if idx not in drop_current)
     merged.sort(key=lambda seg: (float(seg.get("start", 0.0)), float(seg.get("end", seg.get("start", 0.0)))))
+    logging.debug(
+        "merge_chunk_segments result previous_dropped=%s current_dropped=%s merged_segments=%s",
+        sorted(drop_previous),
+        sorted(drop_current),
+        len(merged),
+    )
     return merged
 
 
@@ -1062,12 +1177,21 @@ def _resolve_overlap_window(
     previous_indices = list(range(len(previous_overlap)))
     current_indices = list(range(len(current_overlap)))
     matches = _align_overlap_segments(previous_overlap, current_overlap)
+    logging.debug(
+        "resolve_overlap_window start=%.2fs end=%.2fs midpoint=%.2fs %s %s matches=%s",
+        overlap_start,
+        overlap_end,
+        midpoint,
+        _debug_segments_summary("previous", previous_overlap),
+        _debug_segments_summary("current", current_overlap),
+        len(matches),
+    )
 
     consumed_previous: set[int] = set()
     consumed_current: set[int] = set()
     resolved: list[Dict[str, Any]] = []
 
-    for prev_idx, curr_idx, _score in matches:
+    for prev_idx, curr_idx, score in matches:
         consumed_previous.add(prev_idx)
         consumed_current.add(curr_idx)
         previous_seg = previous_overlap[prev_idx]
@@ -1076,10 +1200,21 @@ def _resolve_overlap_window(
         current_text = str(current_seg.get("text") or "")
         if _normalize_alignment_text(previous_text) == _normalize_alignment_text(current_text):
             chosen = previous_seg if _segment_midpoint(previous_seg) <= midpoint else current_seg
+            choice_reason = "same-text-midpoint"
         elif _segment_midpoint(previous_seg) < midpoint:
             chosen = previous_seg
+            choice_reason = "first-half-prefer-previous"
         else:
             chosen = current_seg
+            choice_reason = "second-half-prefer-current"
+        logging.debug(
+            "resolve_overlap_window match score=%.4f reason=%s previous=(%s) current=(%s) chosen=(%s)",
+            score,
+            choice_reason,
+            _debug_segment_summary(previous_seg),
+            _debug_segment_summary(current_seg),
+            _debug_segment_summary(chosen),
+        )
         resolved.append(chosen)
 
     # Preserve unmatched overlap speech from both sides; for online updates it is
@@ -1087,11 +1222,19 @@ def _resolve_overlap_window(
     for prev_idx in previous_indices:
         if prev_idx in consumed_previous:
             continue
+        logging.debug(
+            "resolve_overlap_window preserving unmatched previous=(%s)",
+            _debug_segment_summary(previous_overlap[prev_idx]),
+        )
         resolved.append(previous_overlap[prev_idx])
 
     for curr_idx in current_indices:
         if curr_idx in consumed_current:
             continue
+        logging.debug(
+            "resolve_overlap_window preserving unmatched current=(%s)",
+            _debug_segment_summary(current_overlap[curr_idx]),
+        )
         resolved.append(current_overlap[curr_idx])
 
     resolved.sort(key=lambda seg: (float(seg.get("start", 0.0)), float(seg.get("end", seg.get("start", 0.0)))))
@@ -1099,8 +1242,14 @@ def _resolve_overlap_window(
     deduped: list[Dict[str, Any]] = []
     for seg in resolved:
         if deduped and _segment_alignment_score(deduped[-1], seg) >= 0.9:
+            logging.debug(
+                "resolve_overlap_window deduping segment=(%s) against previous=(%s)",
+                _debug_segment_summary(seg),
+                _debug_segment_summary(deduped[-1]),
+            )
             continue
         deduped.append(seg)
+    logging.debug("resolve_overlap_window result %s", _debug_segments_summary("deduped", deduped))
     return deduped
 
 
@@ -1142,14 +1291,32 @@ class ChunkResolvedEmitter:
         self._pending_tail: list[Dict[str, Any]] = []
         self._emitted: list[Dict[str, Any]] = []
 
-    def _emit(self, segments: list[Dict[str, Any]]) -> None:
+    @staticmethod
+    def _segment_time_bounds(segments: list[Dict[str, Any]]) -> tuple[float, float]:
         if not segments:
+            return 0.0, 0.0
+        start = float(segments[0].get("start", 0.0))
+        end = float(segments[-1].get("end", segments[-1].get("start", 0.0)))
+        return start, end
+
+    def _emit(self, segments: list[Dict[str, Any]], *, reason: str) -> None:
+        if not segments:
+            logging.info("resolved emitter skipped empty emission reason=%s", reason)
             return
+        start, end = self._segment_time_bounds(segments)
+        logging.info(
+            "resolved emitter emitting reason=%s segments=%s start=%.2fs end=%.2fs",
+            reason,
+            len(segments),
+            start,
+            end,
+        )
         emitted_segments: list[Dict[str, Any]] = []
         for segment in segments:
             resolved = dict(segment)
             if self._segment_transformer is not None:
                 resolved = self._segment_transformer(resolved)
+            logging.debug("resolved emitter utterance reason=%s %s", reason, _debug_segment_summary(resolved))
             emitted_segments.append(resolved)
             if self._segment_observer is not None:
                 self._segment_observer(dict(resolved))
@@ -1167,28 +1334,46 @@ class ChunkResolvedEmitter:
         chunk_end: float,
         is_last: bool,
     ) -> None:
+        logging.info(
+            "resolved emitter processing chunk start=%.2fs end=%.2fs is_last=%s overlap=%.2fs pending_tail=%s incoming_segments=%s",
+            chunk_start,
+            chunk_end,
+            is_last,
+            self._overlap_seconds,
+            len(self._pending_tail),
+            len(segments),
+        )
         if self._overlap_seconds <= 0:
-            self._emit(segments)
+            self._emit(segments, reason="no-overlap")
             return
 
         overlap_end = min(chunk_end, chunk_start + self._overlap_seconds)
         current_head = [seg for seg in segments if float(seg.get("start", 0.0)) < overlap_end]
         current_body = [seg for seg in segments if float(seg.get("start", 0.0)) >= overlap_end]
+        had_pending_tail = bool(self._pending_tail)
 
         first_non_overlap: list[Dict[str, Any]] = []
-        if self._pending_tail:
+        if had_pending_tail:
             resolved_overlap = _resolve_overlap_window(self._pending_tail, current_head, chunk_start, overlap_end)
-            self._emit(resolved_overlap)
+            logging.info(
+                "resolved emitter resolved overlap window start=%.2fs end=%.2fs previous_tail=%s current_head=%s resolved=%s",
+                chunk_start,
+                overlap_end,
+                len(self._pending_tail),
+                len(current_head),
+                len(resolved_overlap),
+            )
+            self._emit(resolved_overlap, reason="resolved-overlap")
         else:
             first_non_overlap = [seg for seg in segments if float(seg.get("end", seg.get("start", 0.0))) <= max(chunk_end - self._overlap_seconds, 0.0)]
-            self._emit(first_non_overlap)
+            self._emit(first_non_overlap, reason="initial-non-overlap")
 
         if is_last:
             if not self._pending_tail:
                 trailing = [seg for seg in segments if seg not in first_non_overlap]
-                self._emit(trailing)
+                self._emit(trailing, reason="last-trailing")
             else:
-                self._emit(current_body)
+                self._emit(current_body, reason="last-body")
             self._pending_tail = []
             return
 
@@ -1196,12 +1381,21 @@ class ChunkResolvedEmitter:
         current_non_overlap = [
             seg for seg in segments if float(seg.get("start", 0.0)) >= overlap_end and float(seg.get("end", seg.get("start", 0.0))) <= tail_start
         ]
-        self._emit(current_non_overlap)
+        if had_pending_tail:
+            self._emit(current_non_overlap, reason="mid-body")
         self._pending_tail = [seg for seg in segments if float(seg.get("end", seg.get("start", 0.0))) > tail_start]
+        pending_start, pending_end = self._segment_time_bounds(self._pending_tail)
+        logging.info(
+            "resolved emitter buffered tail segments=%s start=%.2fs end=%.2fs",
+            len(self._pending_tail),
+            pending_start,
+            pending_end,
+        )
 
     def finalize(self) -> None:
         if self._pending_tail:
-            self._emit(self._pending_tail)
+            logging.info("resolved emitter finalizing pending tail segments=%s", len(self._pending_tail))
+            self._emit(self._pending_tail, reason="finalize-tail")
             self._pending_tail = []
 
 
@@ -1224,6 +1418,7 @@ class VerbatimService:
             whisper_model_size=config.model,
             stream=False,
             transcriber=None,
+            transcriber_backend=config.transcriber_backend,
         )
 
     def _build_config(
@@ -1235,6 +1430,9 @@ class VerbatimService:
             stream=False,
             working_dir=None,
         )
+        cfg.transcriber_backend = self._base_config.transcriber_backend
+        cfg.language_identifier_backend = self._base_config.language_identifier_backend
+        cfg.mms_lid_model_size = self._base_config.mms_lid_model_size
         if language:
             cfg.lang = language
         if self._base_config.beam_size is not None:
@@ -1644,16 +1842,93 @@ class MlxVibeVoiceService:
         try:
             buffer = ""
             estimated_finish = progress_finish if progress_finish is not None else audio.duration_seconds
+            stream_items = 0
+            status_events = 0
+            first_activity_logged = False
+            raw_text_chunks = 0
+            raw_text_characters = 0
+            parsed_object_count = 0
+            nonprogress_payloads = 0
+            progress_payloads = 0
+            last_stream_yield_at = time.monotonic()
+            last_progress_at: Optional[float] = None
+            last_progress_value: Optional[float] = None
+            last_text_diagnostic_at = last_stream_yield_at
+            last_payload_diagnostic_at = last_stream_yield_at
+            last_parsed_object_at = last_stream_yield_at
+            last_parse_stall_log_at = 0.0
+            logging.info(
+                "MLX stream start offset=%.2fs duration=%.3fs finish=%.3fs context_chars=%s max_tokens=%s repetition_penalty=%.3f repetition_context_size=%s emit_utterances=%s",
+                progress_offset,
+                audio.duration_seconds,
+                estimated_finish,
+                len(context or ""),
+                self._config.mlx_max_tokens,
+                self._config.mlx_repetition_penalty,
+                self._config.mlx_repetition_context_size,
+                emit_utterances,
+            )
             for chunk in stream_transcribe(
                 audio=audio.samples,
                 sampling_rate=audio.sample_rate,
                 context=context,
                 max_tokens=self._config.mlx_max_tokens,
+                repetition_penalty=self._config.mlx_repetition_penalty,
+                repetition_context_size=self._config.mlx_repetition_context_size,
             ):
+                stream_items += 1
+                now = time.monotonic()
+                idle_since_last_yield = max(0.0, now - last_stream_yield_at)
+                last_stream_yield_at = now
                 if isinstance(chunk, str):
+                    raw_text_chunks += 1
+                    raw_text_characters += len(chunk)
+                    logging.debug(
+                        "MLX stream raw chunk offset=%.2fs item=%s chars=%s text='%s'",
+                        progress_offset,
+                        stream_items,
+                        len(chunk),
+                        _debug_text_preview(chunk, limit=400),
+                    )
                     buffer += chunk
                     objects, buffer = self._iter_json_objects(buffer)
                     if objects:
+                        parsed_object_count += len(objects)
+                        last_parsed_object_at = now
+                    if raw_text_chunks == 1 or idle_since_last_yield >= 5.0 or (now - last_text_diagnostic_at) >= 10.0:
+                        logging.debug(
+                            "MLX stream raw yield offset=%.2fs item=%s idle=%.2fs chars=%s total_text_chars=%s buffer_chars=%s parsed_objects=%s segments=%s",
+                            progress_offset,
+                            stream_items,
+                            idle_since_last_yield,
+                            len(chunk),
+                            raw_text_characters,
+                            len(buffer),
+                            parsed_object_count,
+                            len(segments),
+                        )
+                        last_text_diagnostic_at = now
+                    parse_stall_age = max(0.0, now - last_parsed_object_at)
+                    if not objects and len(buffer) >= 1024 and parse_stall_age >= 5.0 and (now - last_parse_stall_log_at) >= 10.0:
+                        logging.debug(
+                            "MLX stream parse stall offset=%.2fs item=%s buffer_chars=%s parsed_objects=%s stall_age=%.2fs buffer_head='%s' buffer_tail='%s'",
+                            progress_offset,
+                            stream_items,
+                            len(buffer),
+                            parsed_object_count,
+                            parse_stall_age,
+                            _debug_text_preview(buffer[:240]),
+                            _debug_text_preview(buffer[-240:]),
+                        )
+                        last_parse_stall_log_at = now
+                    if objects:
+                        if not first_activity_logged:
+                            logging.info(
+                                "MLX stream produced first parsed JSON object offset=%.2fs items=%s",
+                                progress_offset,
+                                stream_items,
+                            )
+                            first_activity_logged = True
                         for obj in objects:
                             normalized = self._normalize_segment(obj)
                             if normalized is not None:
@@ -1661,6 +1936,12 @@ class MlxVibeVoiceService:
                                 normalized["end"] = round(normalized["end"] + progress_offset, 2)
                                 segments.append(normalized)
                             payload = self._extract_stream_status(obj, estimated_finish)
+                            if payload:
+                                progress = payload.get("progress")
+                                if isinstance(progress, dict) and "current" in progress:
+                                    progress_payloads += 1
+                                else:
+                                    nonprogress_payloads += 1
                             if payload and progress_offset:
                                 progress = payload.get("progress")
                                 if isinstance(progress, dict) and "current" in progress:
@@ -1672,12 +1953,60 @@ class MlxVibeVoiceService:
                                                 max(0.0, min(100.0, (float(progress["current"]) / estimated_finish) * 100.0)),
                                                 1,
                                             )
+                            if payload:
+                                progress = payload.get("progress")
+                                if isinstance(progress, dict) and "current" in progress:
+                                    try:
+                                        current_progress = float(progress["current"])
+                                    except (TypeError, ValueError):
+                                        current_progress = None
+                                    if current_progress is not None:
+                                        delta = None if last_progress_value is None else current_progress - last_progress_value
+                                        since_last_progress = None if last_progress_at is None else max(0.0, now - last_progress_at)
+                                        logging.debug(
+                                            "MLX stream progress offset=%.2fs item=%s current=%.2f delta=%s since_last=%s segments=%s buffer_chars=%s",
+                                            progress_offset,
+                                            stream_items,
+                                            current_progress,
+                                            "n/a" if delta is None else f"{delta:.2f}",
+                                            "n/a" if since_last_progress is None else f"{since_last_progress:.2f}s",
+                                            len(segments),
+                                            len(buffer),
+                                        )
+                                        last_progress_value = current_progress
+                                        last_progress_at = now
+                                elif (now - last_payload_diagnostic_at) >= 10.0:
+                                    logging.debug(
+                                        "MLX stream non-progress payload offset=%.2fs item=%s keys=%s nonprogress_payloads=%s segments=%s buffer_chars=%s",
+                                        progress_offset,
+                                        stream_items,
+                                        sorted(payload.keys()),
+                                        nonprogress_payloads,
+                                        len(segments),
+                                        len(buffer),
+                                    )
+                                    last_payload_diagnostic_at = now
                             if payload and not emit_utterances:
                                 payload.pop("utterance", None)
                             if payload and status_hook is not None:
                                 status_hook(payload)
+                                status_events += 1
                     continue
                 payload = self._extract_stream_status(chunk, estimated_finish)
+                if payload:
+                    progress = payload.get("progress")
+                    if isinstance(progress, dict) and "current" in progress:
+                        progress_payloads += 1
+                    else:
+                        nonprogress_payloads += 1
+                if payload and not first_activity_logged:
+                    logging.info(
+                        "MLX stream produced first status payload offset=%.2fs items=%s keys=%s",
+                        progress_offset,
+                        stream_items,
+                        sorted(payload.keys()),
+                    )
+                    first_activity_logged = True
                 if payload and progress_offset:
                     progress = payload.get("progress")
                     if isinstance(progress, dict) and "current" in progress:
@@ -1686,13 +2015,48 @@ class MlxVibeVoiceService:
                             progress["finish"] = round(estimated_finish, 2)
                             if estimated_finish > 0:
                                 progress["percent"] = round(
-                                    max(0.0, min(100.0, (float(progress["current"]) / estimated_finish) * 100.0)),
-                                    1,
-                                )
+                                max(0.0, min(100.0, (float(progress["current"]) / estimated_finish) * 100.0)),
+                                1,
+                            )
+                if payload:
+                    progress = payload.get("progress")
+                    if isinstance(progress, dict) and "current" in progress:
+                        try:
+                            current_progress = float(progress["current"])
+                        except (TypeError, ValueError):
+                            current_progress = None
+                        if current_progress is not None:
+                            delta = None if last_progress_value is None else current_progress - last_progress_value
+                            since_last_progress = None if last_progress_at is None else max(0.0, now - last_progress_at)
+                            logging.debug(
+                                "MLX stream progress offset=%.2fs item=%s current=%.2f delta=%s since_last=%s segments=%s raw_text_chunks=%s trailing_buffer_chars=%s",
+                                progress_offset,
+                                stream_items,
+                                current_progress,
+                                "n/a" if delta is None else f"{delta:.2f}",
+                                "n/a" if since_last_progress is None else f"{since_last_progress:.2f}s",
+                                len(segments),
+                                raw_text_chunks,
+                                len(buffer),
+                            )
+                            last_progress_value = current_progress
+                            last_progress_at = now
+                    elif stream_items == 1 or idle_since_last_yield >= 5.0 or (now - last_payload_diagnostic_at) >= 10.0:
+                        logging.debug(
+                            "MLX stream payload without progress offset=%.2fs item=%s idle=%.2fs keys=%s nonprogress_payloads=%s segments=%s",
+                            progress_offset,
+                            stream_items,
+                            idle_since_last_yield,
+                            sorted(payload.keys()),
+                            nonprogress_payloads,
+                            len(segments),
+                        )
+                        last_payload_diagnostic_at = now
                 if payload and not emit_utterances:
                     payload.pop("utterance", None)
                 if payload and status_hook is not None:
                     status_hook(payload)
+                    status_events += 1
         except AudioDecodeError:
             raise
         except Exception:
@@ -1705,6 +2069,20 @@ class MlxVibeVoiceService:
                 progress_offset,
             )
             return []
+        last_end = 0.0 if not segments else float(segments[-1].get("end", segments[-1].get("start", 0.0)))
+        logging.info(
+            "MLX stream finished offset=%.2fs segments=%s status_events=%s stream_items=%s raw_text_chunks=%s parsed_objects=%s progress_payloads=%s nonprogress_payloads=%s trailing_buffer_chars=%s last_end=%.2fs",
+            progress_offset,
+            len(segments),
+            status_events,
+            stream_items,
+            raw_text_chunks,
+            parsed_object_count,
+            progress_payloads,
+            nonprogress_payloads,
+            len(buffer),
+            last_end,
+        )
         return segments
 
     def _transcribe_single_file(
@@ -1732,6 +2110,12 @@ class MlxVibeVoiceService:
             emit_utterances=emit_utterances,
         )
         if segments:
+            logging.info(
+                "MLX transcription completed from streaming offset=%.2fs segments=%s text_chars=%s",
+                progress_offset,
+                len(segments),
+                len(_segments_to_plain_text(segments)),
+            )
             return _segments_to_plain_text(segments), segments
 
         logging.warning(
@@ -1743,12 +2127,23 @@ class MlxVibeVoiceService:
             progress_offset,
             len(context or ""),
         )
+        logging.info(
+            "MLX generate fallback start offset=%.2fs duration=%.3fs context_chars=%s max_tokens=%s repetition_penalty=%.3f repetition_context_size=%s",
+            progress_offset,
+            audio.duration_seconds,
+            len(context or ""),
+            self._config.mlx_max_tokens,
+            self._config.mlx_repetition_penalty,
+            self._config.mlx_repetition_context_size,
+        )
         result = model.generate(
             audio=audio.samples,
             sampling_rate=audio.sample_rate,
             context=context,
             max_tokens=self._config.mlx_max_tokens,
             temperature=0.0,
+            repetition_penalty=self._config.mlx_repetition_penalty,
+            repetition_context_size=self._config.mlx_repetition_context_size,
         )
         raw_segments = getattr(result, "segments", None) or []
         if not raw_segments:
@@ -1771,6 +2166,13 @@ class MlxVibeVoiceService:
         text = _segments_to_plain_text(normalized_segments)
         if not text:
             text = (getattr(result, "text", None) or "").strip()
+        logging.info(
+            "MLX generate fallback finished offset=%.2fs raw_segments=%s normalized_segments=%s text_chars=%s",
+            progress_offset,
+            len(raw_segments),
+            len(normalized_segments),
+            len(text),
+        )
         return text, normalized_segments
 
     def transcribe_file(
@@ -1812,6 +2214,11 @@ class MlxVibeVoiceService:
         speaker_resolver = IncrementalSpeakerResolver(audio=audio, enabled=embeddings_enabled)
         try:
             if chunk_seconds <= 0 or total_duration <= chunk_seconds:
+                logging.info(
+                    "running MLX single-window transcription duration=%.3fs embeddings_enabled=%s",
+                    total_duration,
+                    embeddings_enabled,
+                )
                 text, segments = self._transcribe_single_file(
                     model,
                     audio,
@@ -1838,8 +2245,15 @@ class MlxVibeVoiceService:
                     chunk_end=total_duration,
                     is_last=True,
                 )
+                logging.info("waiting for speaker resolution on single-window transcription segments=%s", len(annotated_segments))
                 annotated_segments = speaker_resolver.relabel_segments(annotated_segments)
                 utterances = _segments_to_utterances(annotated_segments, language)
+                logging.info(
+                    "single-window transcription complete segments=%s utterances=%s text_chars=%s",
+                    len(annotated_segments),
+                    0 if utterances is None else len(utterances),
+                    len(_segments_to_plain_text(annotated_segments)),
+                )
                 return _segments_to_plain_text(annotated_segments), annotated_segments, utterances
 
             windows = self._iter_chunk_windows(total_duration, chunk_seconds, overlap_seconds)
@@ -1883,6 +2297,15 @@ class MlxVibeVoiceService:
                     progress_finish=total_duration,
                     emit_utterances=False,
                 )
+                logging.info(
+                    "completed MLX chunk %s/%s start=%.2fs end=%.2fs segments=%s text_chars=%s",
+                    chunk_index,
+                    len(windows),
+                    chunk_start,
+                    chunk_end,
+                    len(chunk_segments),
+                    len(chunk_text),
+                )
                 annotated_chunk_segments: list[Dict[str, Any]] = []
                 for segment in chunk_segments:
                     annotated = speaker_resolver.annotate_segment(segment, chunk_index=chunk_index)
@@ -1895,6 +2318,15 @@ class MlxVibeVoiceService:
                 else:
                     overlap_start = chunk_start
                     overlap_end = min(chunk_end, chunk_start + overlap_seconds)
+                    logging.info(
+                        "merging MLX chunk %s/%s into transcript overlap_start=%.2fs overlap_end=%.2fs prior_segments=%s current_segments=%s",
+                        chunk_index,
+                        len(windows),
+                        overlap_start,
+                        overlap_end,
+                        len(merged_segments),
+                        len(chunk_segments),
+                    )
                     merged_segments = _merge_chunk_segments(merged_segments, chunk_segments, overlap_start, overlap_end)
                 resolved_emitter.process_chunk(
                     chunk_segments,
@@ -1902,12 +2334,28 @@ class MlxVibeVoiceService:
                     chunk_end=chunk_end,
                     is_last=chunk_index == len(windows),
                 )
+                logging.info(
+                    "resolved emitter processed chunk %s/%s merged_segments=%s emitted_segments=%s",
+                    chunk_index,
+                    len(windows),
+                    len(merged_segments),
+                    len(resolved_emitter._emitted),
+                )
                 previous_chunk_text = chunk_text
 
+            logging.info("finalizing resolved emitter after %s chunks", len(windows))
             resolved_emitter.finalize()
+            logging.info("waiting for final speaker resolution merged_segments=%s", len(merged_segments))
             merged_segments = speaker_resolver.relabel_segments(merged_segments)
             text = _segments_to_plain_text(merged_segments)
             utterances = _segments_to_utterances(merged_segments, language)
+            logging.info(
+                "chunked MLX transcription complete chunks=%s segments=%s utterances=%s text_chars=%s",
+                len(windows),
+                len(merged_segments),
+                0 if utterances is None else len(utterances),
+                len(text),
+            )
             return text, merged_segments, utterances
         finally:
             speaker_resolver.close()
@@ -2066,6 +2514,18 @@ async def run(args: argparse.Namespace) -> int:
     requested_backend = _normalize_backend(
         _resolve(args.backend, _cfg_get(config_data, "worker", "backend"), os.environ.get("ASR_BACKEND"), "auto")
     )
+    requested_diarization_strategy = _resolve(
+        args.diarization_strategy,
+        _cfg_get(config_data, "diarization", "strategy"),
+        os.environ.get("DIARIZATION_STRATEGY"),
+        None,
+    )
+    requested_diarization_speakers = _resolve(
+        args.diarization_speakers,
+        _cfg_get(config_data, "diarization", "speakers"),
+        os.environ.get("DIARIZATION_SPEAKERS"),
+        None,
+    )
     verbatim_mods = _load_verbatim_modules(required=False)
 
     if verbatim_mods is not None:
@@ -2075,19 +2535,21 @@ async def run(args: argparse.Namespace) -> int:
         verbatim_user = argparse.Namespace(**vars(verbatim_defaults))
         if args.language:
             verbatim_user.languages = [args.language]
+        elif getattr(verbatim_user, "languages", None) in (None, []):
+            verbatim_user.languages = list(DEFAULT_LANGUAGES)
         if args.beam_size is not None:
             verbatim_user.nb_beams = args.beam_size
-        if args.diarization_strategy:
-            verbatim_user.diarize = args.diarization_strategy
-        if args.diarization_speakers is not None:
-            verbatim_user.speakers = args.diarization_speakers
+        if requested_diarization_strategy:
+            verbatim_user.diarize = requested_diarization_strategy
+        if requested_diarization_speakers is not None:
+            verbatim_user.speakers = requested_diarization_speakers
         verbatim_cfg_args = verbatim_mods.merge_args(verbatim_defaults, profile_overrides, verbatim_user)
     else:
         verbatim_cfg_args = argparse.Namespace(
-            languages=[args.language] if args.language else None,
+            languages=[args.language] if args.language else list(DEFAULT_LANGUAGES),
             nb_beams=args.beam_size,
-            diarize=args.diarization_strategy,
-            speakers=args.diarization_speakers,
+            diarize=requested_diarization_strategy,
+            speakers=requested_diarization_speakers,
             cpu=False,
         )
 
@@ -2192,7 +2654,9 @@ async def run(args: argparse.Namespace) -> int:
     )
 
     if verbatim_mods is not None:
-        output_formats = verbatim_mods.verbatim_configure.build_output_formats(verbatim_cfg_args)
+        output_formats = verbatim_mods.verbatim_configure.build_output_formats(verbatim_cfg_args, default_stdout=False)
+        if not output_formats:
+            output_formats = ["jsonl"]
     else:
         configured_output = _cfg_get_transcription(config_data, "output_format") or _cfg_get_transcription(config_data, "output")
         if str(configured_output or "").strip().lower() == "text":
@@ -2225,8 +2689,26 @@ async def run(args: argparse.Namespace) -> int:
                 args.language,
                 _cfg_get_transcription(config_data, "language") or getattr(verbatim_cfg_args, "languages", None),
                 os.environ.get("WHISPER_LANGUAGE"),
-                None,
+                list(DEFAULT_LANGUAGES),
             )
+        ),
+        transcriber_backend=_resolve(
+            None,
+            _cfg_get_transcription(config_data, "transcriber_backend") or getattr(verbatim_cfg_args, "transcriber_backend", None),
+            os.environ.get("VERBATIM_TRANSCRIBER_BACKEND"),
+            "auto",
+        ),
+        language_identifier_backend=_resolve(
+            None,
+            _cfg_get_transcription(config_data, "language_identifier_backend") or getattr(verbatim_cfg_args, "language_identifier_backend", None),
+            os.environ.get("VERBATIM_LANGUAGE_IDENTIFIER_BACKEND"),
+            "transcriber",
+        ),
+        mms_lid_model_size=_resolve(
+            None,
+            _cfg_get_transcription(config_data, "mms_lid_model_size") or getattr(verbatim_cfg_args, "mms_lid_model_size", None),
+            os.environ.get("VERBATIM_MMS_LID_MODEL_SIZE"),
+            "facebook/mms-lid-126",
         ),
         beam_size=_resolve_int(
             _resolve(args.beam_size, _cfg_get_transcription(config_data, "beam_size"), os.environ.get("WHISPER_BEAM_SIZE"), getattr(verbatim_cfg_args, "nb_beams", None))
@@ -2255,6 +2737,32 @@ async def run(args: argparse.Namespace) -> int:
                 32768,
             )
             or 32768,
+        ),
+        mlx_repetition_penalty=max(
+            1.0,
+            _resolve_float(
+                _resolve(
+                    getattr(args, "mlx_repetition_penalty", None),
+                    _cfg_get_transcription(config_data, "mlx_repetition_penalty"),
+                    os.environ.get("MLX_REPETITION_PENALTY"),
+                    1.08,
+                ),
+                1.08,
+            )
+            or 1.08,
+        ),
+        mlx_repetition_context_size=max(
+            1,
+            _resolve_int(
+                _resolve(
+                    getattr(args, "mlx_repetition_context_size", None),
+                    _cfg_get_transcription(config_data, "mlx_repetition_context_size"),
+                    os.environ.get("MLX_REPETITION_CONTEXT_SIZE"),
+                    256,
+                ),
+                256,
+            )
+            or 256,
         ),
         mlx_chunk_seconds=max(
             0.0,
@@ -2415,8 +2923,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-wait-seconds", type=int, default=None)
     parser.add_argument("--concurrency", type=int, default=None, help="number of concurrent job workers")
     parser.add_argument("--once", action="store_true", default=None, help="exit after handling one job")
-    parser.add_argument("--model", default=None, help="whisper model size or path")
-    parser.add_argument("--device", default=None, help="whisper device: auto|cpu|cuda|mps")
+    parser.add_argument("--model", default=None, help="ASR model id, size, or local path")
+    parser.add_argument("--device", default=None, help="inference device: auto|cpu|cuda|mps")
     parser.add_argument("--compute-type", default=None, help="unused (kept for compatibility)")
     parser.add_argument("--backend", default=None, help="backend: auto|verbatim|mlx-vibevoice")
     parser.add_argument("--strategy", default=None, help="transcription strategy: verbatim|fast")

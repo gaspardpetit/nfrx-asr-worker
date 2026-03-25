@@ -37,9 +37,3 @@ dev = []
 
 [tool.uv]
 package = true
-conflicts = [
-  [
-    { extra = "verbatim" },
-    { extra = "mlx" },
-  ],
-]
