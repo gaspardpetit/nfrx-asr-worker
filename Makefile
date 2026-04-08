@@ -12,7 +12,7 @@ install-mlx:
 install-verbatim:
 	uv pip install --python $(PYTHON) -e .
 	uv pip install --python $(PYTHON) "verbatim[diarization,qwen,mms_lid] @ git+https://github.com/gaspardpetit/verbatim.git@main"
-	uv pip install --python $(PYTHON) "git+https://github.com/gaspardpetit/senko.git@feature/in-memory-diarization"
+	uv pip install --python $(PYTHON) "git+https://github.com/narcotic-sh/senko.git@feature/in-memory-diarization"
 
 install-cpu: install
 	uv pip install --python $(PYTHON) torch==2.8.0+cpu torchvision==0.23.0+cpu torchaudio==2.8.0+cpu --index-url https://download.pytorch.org/whl/cpu --reinstall
