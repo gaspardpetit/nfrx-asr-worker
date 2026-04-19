@@ -16,7 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 verbatim = [
-  "verbatim[diarization]>=1.3.4",
+  "verbatim[diarization,dss]>=1.3.5",
 ]
 
 [project.scripts]
