@@ -18,9 +18,6 @@ dependencies = [
 verbatim = [
   "verbatim[diarization]>=1.3.4",
 ]
-mlx = [
-  "mlx-audio>=0.4.1 ; sys_platform == 'darwin'",
-]
 
 [project.scripts]
 transcribe-worker = "transcribe.worker:main"

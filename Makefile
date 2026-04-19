@@ -6,9 +6,6 @@ UNAME_S := $(shell uname -s)
 install:
 	uv sync --python $(PYTHON)
 
-install-mlx:
-	uv sync --python $(PYTHON) --extra mlx
-
 install-verbatim:
 	uv pip install --python $(PYTHON) -e .
 	uv pip install --python $(PYTHON) "verbatim[diarization,qwen,mms_lid] @ git+https://github.com/gaspardpetit/verbatim.git@main"
@@ -30,10 +27,6 @@ run:
 	VERBATIM_LANGUAGE_IDENTIFIER_BACKEND=mms \
 	VERBATIM_MMS_LID_MODEL_SIZE=facebook/mms-lid-126 \
 	DIARIZATION_STRATEGY=senko \
-	uv run --no-sync --python $(PYTHON) transcribe-worker
-
-run-mlx:
-	$(MAKE) install-mlx
 	uv run --no-sync --python $(PYTHON) transcribe-worker
 
 # Auto-fix with Ruff (format + quick fixes)

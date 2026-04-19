@@ -1,13 +1,6 @@
 import unittest
-from unittest.mock import patch
-
-import numpy as np
-
-from transcribe.audio import AudioBuffer
 from transcribe.worker import (
     ChunkResolvedEmitter,
-    MlxVibeVoiceService,
-    TranscriptionConfig,
     _align_overlap_segments,
     _format_jsonl_output,
     _public_segment_speaker,
@@ -95,12 +88,6 @@ class ChunkAlignmentTests(unittest.TestCase):
                 "Alice clarifies the operating margin.",
             ],
         )
-
-    def test_iter_chunk_windows_uses_configured_overlap(self) -> None:
-        windows = MlxVibeVoiceService._iter_chunk_windows(3600.0, 1200.0, 60.0)
-        self.assertEqual(windows[0], (0.0, 1200.0))
-        self.assertEqual(windows[1], (1140.0, 2340.0))
-        self.assertEqual(windows[-1], (3420.0, 3600.0))
 
     def test_resolve_overlap_window_prefers_previous_in_first_half_and_current_in_second_half(self) -> None:
         previous_overlap = [
@@ -307,61 +294,6 @@ class ChunkAlignmentTests(unittest.TestCase):
     def test_public_segment_speaker_hides_unresolved_chunk_local_labels(self) -> None:
         self.assertIsNone(_public_segment_speaker({"speaker": "chunk2:0", "_chunk_index": 2, "_local_speaker": "0"}))
         self.assertEqual(_public_segment_speaker({"speaker": "SPEAKER_03", "_chunk_index": 2, "_local_speaker": "0"}), "3")
-
-    def test_short_file_mlx_status_hook_uses_resolved_emitter_for_utterances(self) -> None:
-        updates = []
-
-        class FakeResolver:
-            def __init__(self, *, audio, enabled=True):
-                self.audio = audio
-                self.enabled = enabled
-
-            def annotate_segment(self, segment, *, chunk_index):
-                annotated = dict(segment)
-                annotated["_chunk_index"] = chunk_index
-                annotated["_local_speaker"] = segment.get("speaker")
-                return annotated
-
-            def label_for_emission(self, segment):
-                updated = dict(segment)
-                updated["speaker"] = "SPEAKER_07"
-                return updated
-
-            def observe_emitted_segment(self, segment):
-                return None
-
-            def relabel_segments(self, segments):
-                relabeled = []
-                for segment in segments:
-                    updated = dict(segment)
-                    updated["speaker"] = "SPEAKER_07"
-                    relabeled.append(updated)
-                return relabeled
-
-            def close(self):
-                return None
-
-        service = MlxVibeVoiceService(TranscriptionConfig(model="fake", mlx_chunk_seconds=9999.0))
-        service._get_model = lambda: object()
-
-        def fake_transcribe_single_file(self, model, audio, language, context, status_hook, progress_offset=0.0, progress_finish=None, emit_utterances=True):
-            if emit_utterances:
-                raise AssertionError("short-file path should suppress raw utterance streaming")
-            if status_hook is not None:
-                status_hook({"phase": "transcribing", "progress": {"current": 1.0, "finish": 2.0, "units": "seconds"}})
-            return "hello", [{"speaker": "0", "start": 0.0, "end": 1.0, "text": "hello"}]
-
-        service._transcribe_single_file = fake_transcribe_single_file.__get__(service, MlxVibeVoiceService)
-
-        with patch("transcribe.worker.normalize_audio_buffer", return_value=AudioBuffer(samples=np.zeros(24000, dtype=np.float32), sample_rate=24000)):
-            with patch("transcribe.worker.IncrementalSpeakerResolver", FakeResolver):
-                _text, _segments, _utterances = service.transcribe_bytes(b"payload", "sample.wav", None, status_hook=updates.append)
-
-        self.assertEqual(updates[0]["progress"]["current"], 1.0)
-        self.assertNotIn("utterance", updates[0])
-        self.assertEqual(updates[1]["utterance"]["speaker"], "7")
-        self.assertEqual(updates[1]["utterance"]["text"], "hello")
-
 
 if __name__ == "__main__":
     unittest.main()
